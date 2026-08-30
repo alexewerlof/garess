@@ -16,18 +16,48 @@ Key rules (each one caused a real bug):
   builder panics.
 - **Focus at construction.** The composer `textarea` must be `.Focus()`ed in
   `New` (not `Init`, which runs on a value copy).
-- **Stream lifecycle.** `startStream(content)` starts the pump goroutine
-  (`runner.Run` + `runner.WithYieldUserMessage()`), returns `waitForADK` as
-  the Cmd, and marks `m.streaming`. Partial events are buffered and flushed on
-  a 50ms render tick; the FINAL non-partial event supersedes the partials
-  (clears buffers, appends to `m.events`, `renderAll`). `esc` cancels via
-  context.
-- **Rendering.** `m.events` (the display history) feeds `m.rendered` (cached
-  ANSI, parallel). `renderEvent` dispatches on content parts: user text,
-  assistant text (+ hidden thinking via `renderThinking`), FunctionCall →
-  tool block, FunctionResponse → result block, `adk_request_confirmation` →
-  waiting marker. Markdown via glamour; ephemeral command output goes through
-  `addInfo`.
+- **Stream lifecycle.** `startStream(content)` starts a two-goroutine pump:
+  a feeder drains the runner iterator (`runner.Run` +
+  `runner.WithYieldUserMessage()`) into a raw channel, and a coalescer batches
+  streaming (Partial) deltas and delivers them as ONE `adkEventMsg.batch` on a
+  fixed `streamBatchInterval` (50ms) cadence, capped by `streamBatchCap` (64).
+  Completed events and errors go through immediately. `handleADK` buffers a
+  batch and `flushStream()`s right away — one frame per batch, not one per
+  token (token-rate Views were the remaining RPi sluggishness). There is no
+  render tick anymore. The FINAL non-partial event supersedes the partials
+  (clears buffers, appends to `m.events` + `m.rendered`, `updateViewport`).
+  `esc` cancels via context; the streamed partials stay on screen.
+- **Rendering (incremental, cache-everything).** `m.events` (the display
+  history) feeds `m.rendered` (cached ANSI, parallel) — completed events are
+  rendered ONCE via `renderEvent` and appended; they are never re-rendered.
+  The live assistant reply streams through `streamChunker`: each flush
+  finalizes stable markdown chunks (split at blank lines outside code fences,
+  capped at `assistantChunkCap` = 600 chars) and glamour-renders them once;
+  only the small tail chunk is re-rendered per batch.
+  **Do not call `renderAll()` on the streaming path** — it re-glamours the
+  whole session and made the single-threaded Bubble Tea loop block for
+  seconds as sessions grew (RPi 1: one token every few seconds, Esc dead).
+  `renderAll()` is only for rare full refreshes (resize, `/new`, ctrl+t).
+- **View layer (`convView`, NOT bubbles/viewport).** The conversation is
+  rendered by `convView` (internal/tui/convview.go): a bottom-anchored,
+  append-only line viewer. `updateViewport()` appends new stable parts
+  (completed events, finalized chunks, ephemeral) ONCE — O(delta) — and
+  replaces the bounded live tail (`streamTail`) in place — O(tail). Stable
+  parts live in `conv.lines`, the live tail in `conv.live` (kept separate so
+  appending stable content never freezes the old tail). `view()` is a plain
+  join of the visible window (O(height)). Never reintroduce
+  bubbles/viewport.SetContent: it re-splits and re-measures the WHOLE
+  conversation per tick (O(session)) and its View() re-applies per-line
+  lipgloss padding per frame — on a Pi 1 that alone was ~65–170ms per frame
+  (GARESS_STATS `view` bucket) and 1s+ per SetContent. Scroll keys
+  (up/down/pgup/pgdown/home/end) go through `Model.scroll` → convView.
+  `updateViewport` does NOT force `gotoBottom()`: `setLive`/`clamp` keep the
+  user's scroll position, and being at the bottom stays pinned automatically
+  (yOff == 0). `startStream` force-scrolls to bottom so a new response is
+  visible. Scrollback works both during and after streaming: page keys always
+  scroll; arrows scroll when the conversation overflows the viewport, otherwise
+  they edit the composer.
+
 - **HITL confirmation.** When a run yields an `adk_request_confirmation`
   FunctionCall, the run ends; `enterConfirmation` records the wrapper IDs and
   the TUI enters `m.confirming` (y/n prompt in the status line). `y`/`n`
@@ -36,6 +66,20 @@ Key rules (each one caused a real bug):
   value produced by `startStream` (never a fresh copy).
 - **Thinking blocks.** Model reasoning arrives as `genai.Part{Thought: true}`;
   hidden by default, `ctrl+t` toggles `m.showThinking` and re-renders.
+  Streaming thinking is chunked too — `m.assistantThinking` is a
+  `streamChunker` with a lipgloss renderer (`newStreamChunkerWith`), so only
+  the thinking tail re-renders per batch. Never re-render the whole thinking
+  per batch (that was `renderThinking(allThinking)` in the old `streamTail`)
+  — with ctrl+t on it made updateViewport quadratic again while the model
+  reasoned.
+  **Thinking freezes when visible text starts** (`freezeThinking` in
+  `flushStream`): the rendered thinking becomes `m.thinkingBlock`, a stable
+  part placed BEFORE the response chunks in `stableParts`, and drops out of
+  the live tail. Without this, finalized response paragraphs were appended
+  ABOVE the tall live thinking block and got pushed out of view ("every new
+  paragraph wipes out the previous text"). `toggleThinking` re-renders the
+  frozen block when it was already frozen. `m.thinkingFrozen`/`m.thinkingBlock`
+  are reset in startStream/completion/`/new`.
 - **Instructions.** AGENTS.md/SYSTEM.md + skills text is pushed into the
   shared `harness.Preamble` (read by the agent's InstructionProvider every
   run); `/agents reload` / `/skills reload` just update it — no rebuild.

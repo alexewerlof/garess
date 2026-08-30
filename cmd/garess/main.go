@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	_ "net/http/pprof" // GARESS_PPROF_ADDR exposes /debug/pprof for CPU profiling
 	"os"
 	"path/filepath"
 	"sort"
@@ -145,6 +147,18 @@ func runTUI(cfgPath, providerName, modelName string) error {
 	}
 	for _, w := range cfg.Warnings {
 		slog.Warn(w)
+	}
+
+	// Optional CPU profiling endpoint: GARESS_PPROF_ADDR=:6060. While the TUI
+	// is slow, capture a profile from another SSH session with:
+	//   curl -o /tmp/garess.pprof 'http://<pi>:6060/debug/pprof/profile?seconds=30'
+	if addr := os.Getenv("GARESS_PPROF_ADDR"); addr != "" {
+		go func() {
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				slog.Warn("pprof server", "addr", addr, "err", err)
+			}
+		}()
+		slog.Info("pprof server listening", "addr", addr)
 	}
 
 	wd, err := os.Getwd()

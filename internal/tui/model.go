@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"google.golang.org/genai"
@@ -33,7 +32,13 @@ import (
 )
 
 const (
-	renderInterval  = 50 * time.Millisecond
+	// streamBatchInterval is how long the pump coalesces streamed deltas before
+	// delivering them as one message, so Bubble Tea composes one frame per
+	// batch instead of one per token (matches the old 50ms display cadence).
+	streamBatchInterval = 50 * time.Millisecond
+	// streamBatchCap bounds a single batch under a fast token burst.
+	streamBatchCap = 64
+
 	spinnerInterval = 100 * time.Millisecond
 )
 
@@ -58,9 +63,10 @@ type Model struct {
 	width  int
 	height int
 
-	viewport viewport.Model
-	textarea textarea.Model
-	md       *markdownRenderer
+	conv          *convView // append-only conversation line viewer
+	viewCommitted int       // stable parts already appended to conv
+	textarea      textarea.Model
+	md            *markdownRenderer
 
 	// events is the display history (parallel to rendered), fed by the runner.
 	events    []*session.Event
@@ -70,15 +76,17 @@ type Model struct {
 	streaming         bool
 	cancelled         bool
 	cancel            context.CancelFunc
-	adkCh             <-chan adkEvent
-	streamBuffer      *strings.Builder
-	thinkingBuffer    *strings.Builder
-	assistantContent  string
-	assistantThinking string
-	pendingAssistant  bool
-	renderTickActive  bool
+	adkCh             <-chan adkEventMsg
+	streamBuffer      *strings.Builder // raw text deltas awaiting the next pump batch
+	thinkingBuffer    *strings.Builder // raw thinking deltas (hidden by default)
+	assistantActive   bool             // an assistant reply is being streamed
+	assistantChunks   *streamChunker   // streaming text: completed chunks cached, tail re-rendered
+	assistantThinking *streamChunker   // streaming thinking (chunked, rendered only when shown)
+	thinkingBlock     string           // frozen thinking block (stable, above the response)
+	thinkingFrozen    bool             // thinking finalized once visible text starts
 	spinnerIdx        int
 	streamFailed      bool
+	stats             *tuiStats // GARESS_STATS=1 CPU-time breakdown (nil = disabled)
 
 	// HITL confirmation mode (ADK tool confirmation round trip).
 	confirming        bool
@@ -100,10 +108,10 @@ type adkEvent struct {
 // Messages sent to Update.
 type (
 	spinnerTickMsg struct{}
-	renderTickMsg  struct{}
 	adkEventMsg    struct {
-		evt  adkEvent
-		done bool
+		evt   adkEvent
+		batch []adkEvent // coalesced streaming deltas from the pump
+		done  bool
 	}
 )
 
@@ -121,24 +129,32 @@ func New(providers map[string]*harness.Provider, current, theme, userID, session
 	ta.Focus() // focus must be set before Init (Init runs on a value copy)
 
 	m := &Model{
-		providers:      providers,
-		current:        current,
-		theme:          theme,
-		userID:         userID,
-		sessionID:      sessionID,
-		memory:         mem,
-		preamble:       preamble,
-		workDir:        workDir,
-		width:          width,
-		height:         height,
-		textarea:       ta,
-		md:             md,
-		streamBuffer:   &strings.Builder{}, // pointer: the Model is copied by Bubble Tea on every Update
-		thinkingBuffer: &strings.Builder{}, // pointer: see streamBuffer
+		providers:       providers,
+		current:         current,
+		theme:           theme,
+		userID:          userID,
+		sessionID:       sessionID,
+		memory:          mem,
+		preamble:        preamble,
+		workDir:         workDir,
+		width:           width,
+		height:          height,
+		textarea:        ta,
+		md:              md,
+		streamBuffer:    &strings.Builder{}, // pointer: the Model is copied by Bubble Tea on every Update
+		thinkingBuffer:  &strings.Builder{}, // pointer: see streamBuffer
+		assistantChunks: newStreamChunker(), // pointer: see streamBuffer
+		assistantThinking: newStreamChunkerWith(func(s string) string {
+			return ui.thinkingBody.Render(s)
+		}), // pointer: see streamBuffer
+	}
+	if statsEnabled() {
+		m.stats = newTUIStats()
+		go m.stats.reportLoop(5 * time.Second)
 	}
 	m.loadAgents()
 	m.loadSkills()
-	m.viewport = viewport.New(maxInt(width-4, 20), 1)
+	m.conv = newConvView(1)
 	m.layout()
 	m.renderAll()
 	return m, nil
@@ -160,6 +176,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rebuildRenderer()
 		m.layout()
 		m.renderAll()
+		if m.assistantActive {
+			// Re-render the streaming slot at the new wrap width.
+			m.assistantChunks.rechunk(m.md)
+			m.resetView()
+			m.updateViewport()
+		}
 		return m, nil
 
 	case spinnerTickMsg:
@@ -171,11 +193,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case adkEventMsg:
 		return m.handleADK(msg)
-
-	case renderTickMsg:
-		m.renderTickActive = false
-		m.flushStream()
-		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -192,6 +209,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleADK processes one pumped runner event.
 func (m Model) handleADK(msg adkEventMsg) (tea.Model, tea.Cmd) {
+	if m.stats != nil {
+		start := time.Now()
+		defer func() { m.stats.add(statADK, time.Since(start)) }()
+	}
 	if msg.evt.err != nil {
 		if !m.cancelled {
 			m.err = msg.evt.err.Error()
@@ -203,57 +224,59 @@ func (m Model) handleADK(msg adkEventMsg) (tea.Model, tea.Cmd) {
 	if msg.done {
 		return m.finishStreaming()
 	}
+	// Coalesced streaming deltas from the pump: buffer and flush them now —
+	// one frame per batch, on a fixed cadence, instead of once per token.
+	if msg.batch != nil {
+		m.bufferDeltas(msg.batch)
+		m.flushStream()
+		return m, waitForADK(m.adkCh)
+	}
 	ev := msg.evt.ev
 	if ev == nil || ev.Content == nil {
 		return m, waitForADK(m.adkCh)
 	}
 
 	if ev.Partial {
-		// Streaming delta: buffer for the 50ms render tick.
-		for _, p := range ev.Content.Parts {
-			if p.Thought {
-				m.thinkingBuffer.WriteString(p.Text)
-			} else if p.Text != "" {
-				m.streamBuffer.WriteString(p.Text)
-			}
-		}
-		next := waitForADK(m.adkCh)
-		if m.renderTickActive {
-			return m, next
-		}
-		m.renderTickActive = true
-		return m, tea.Batch(next, tea.Tick(renderInterval, func(time.Time) tea.Msg { return renderTickMsg{} }))
+		// Single delta fallback (the pump normally batches these).
+		m.bufferDeltas([]adkEvent{{ev: ev}})
+		m.flushStream()
+		return m, waitForADK(m.adkCh)
 	}
 
 	// Completed event (user echo, model response, tool call/result, or a
 	// confirmation request). The final model event supersedes any streamed
-	// partials, so clear the in-flight buffers.
-	m.pendingAssistant = false
-	m.assistantContent = ""
-	m.assistantThinking = ""
+	// partials, so clear the in-flight buffers. The event is rendered once and
+	// appended to the cache — completed history is never re-rendered.
+	m.assistantActive = false
+	m.assistantChunks.reset()
+	m.assistantThinking.reset()
+	m.thinkingBlock = ""
+	m.thinkingFrozen = false
 	m.streamBuffer.Reset()
 	m.thinkingBuffer.Reset()
 
-	if isConfirmationRequest(ev) {
-		m.events = append(m.events, ev)
-		m.enterConfirmation(ev)
-		m.renderAll()
-		return m, waitForADK(m.adkCh)
-	}
-
 	m.events = append(m.events, ev)
-	m.renderAll()
+	m.rendered = append(m.rendered, m.renderEvent(ev))
+
+	if isConfirmationRequest(ev) {
+		m.enterConfirmation(ev)
+	}
+	// The final event superseded the streaming chunks; discard the view cache
+	// so the next update is a clean full rebuild.
+	m.resetView()
+	m.updateViewport()
 	return m, waitForADK(m.adkCh)
 }
 
-// waitForADK fetches the next event from the pump channel as a Cmd.
-func waitForADK(ch <-chan adkEvent) tea.Cmd {
+// waitForADK fetches the next pumped message (a batch of deltas, a single
+// completed event, or the end-of-stream marker) as a Cmd.
+func waitForADK(ch <-chan adkEventMsg) tea.Cmd {
 	return func() tea.Msg {
-		evt, ok := <-ch
+		msg, ok := <-ch
 		if !ok {
 			return adkEventMsg{done: true}
 		}
-		return adkEventMsg{evt: evt}
+		return msg
 	}
 }
 
@@ -277,13 +300,26 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc", "ctrl+c":
 			m.cancelStream()
 		case "up", "down", "pgup", "pgdown", "home", "end":
-			var cmd tea.Cmd
-			m.viewport, cmd = m.viewport.Update(msg)
-			return m, cmd
+			m.scroll(msg.String())
+			return m, nil
 		case "ctrl+t":
 			return m.toggleThinking()
 		}
 		return m, nil
+	}
+
+	// Scrollback stays available after streaming. Page keys always scroll;
+	// arrows scroll too when there is overflow, otherwise they edit the
+	// composer.
+	switch msg.String() {
+	case "pgup", "pgdown", "home", "end":
+		m.scroll(msg.String())
+		return m, nil
+	case "up", "down":
+		if m.conv.maxScroll() > 0 {
+			m.scroll(msg.String())
+			return m, nil
+		}
 	}
 
 	switch msg.String() {
@@ -334,23 +370,84 @@ func (m Model) startStream(content *genai.Content) (tea.Model, tea.Cmd) {
 	m.streaming = true
 	m.cancelled = false
 	m.streamFailed = false
-	m.assistantContent = ""
-	m.assistantThinking = ""
-	m.pendingAssistant = false
+	m.assistantActive = false
+	m.assistantChunks.reset()
+	m.assistantThinking.reset()
+	m.thinkingBlock = ""
+	m.thinkingFrozen = false
 	m.streamBuffer.Reset()
 	m.thinkingBuffer.Reset()
+	// A new response streams at the bottom; show it even if the user had
+	// scrolled up during the previous turn.
+	m.conv.gotoBottom()
 
-	ch := make(chan adkEvent, 1)
+	ch := make(chan adkEventMsg, 1)
 	go func() {
 		defer close(ch)
-		it := prov.Runner.Run(ctx, m.userID, m.sessionID, content,
-			agent.RunConfig{StreamingMode: agent.StreamingModeSSE},
-			runner.WithYieldUserMessage())
-		for ev, err := range it {
+		// Feeder: pull events from the runner iterator without blocking the
+		// HTTP read on Bubble Tea's pace (this is the "fill a buffer" half).
+		raw := make(chan adkEvent, 16)
+		go func() {
+			defer close(raw)
+			it := prov.Runner.Run(ctx, m.userID, m.sessionID, content,
+				agent.RunConfig{StreamingMode: agent.StreamingModeSSE},
+				runner.WithYieldUserMessage())
+			for ev, err := range it {
+				select {
+				case raw <- adkEvent{ev: ev, err: err}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		// Coalescer: deliver streaming deltas as batches on a fixed cadence;
+		// completed events and errors go through immediately.
+		ticker := time.NewTicker(streamBatchInterval)
+		defer ticker.Stop()
+		var batch []adkEvent
+		send := func(msg adkEventMsg) bool {
 			select {
-			case ch <- adkEvent{ev, err}:
+			case ch <- msg:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			b := batch
+			batch = nil
+			return send(adkEventMsg{batch: b})
+		}
+		for {
+			select {
 			case <-ctx.Done():
 				return
+			case ae, ok := <-raw:
+				if !ok {
+					flush() // drain any remaining deltas before signalling done
+					return
+				}
+				if ae.err != nil {
+					flush()
+					send(adkEventMsg{evt: adkEvent{err: ae.err}})
+					return
+				}
+				if ae.ev == nil || !ae.ev.Partial {
+					flush()
+					if ae.ev != nil && !send(adkEventMsg{evt: adkEvent{ev: ae.ev}}) {
+						return
+					}
+					continue
+				}
+				batch = append(batch, adkEvent{ev: ae.ev})
+				if len(batch) >= streamBatchCap {
+					flush()
+				}
+			case <-ticker.C:
+				flush() // bounded latency even if the model pauses mid-batch
 			}
 		}
 	}()
@@ -359,8 +456,33 @@ func (m Model) startStream(content *genai.Content) (tea.Model, tea.Cmd) {
 	return m, waitForADK(ch)
 }
 
+// bufferDeltas appends streamed text deltas (from a coalesced pump batch) to
+// the pending buffers, keeping thought and visible text separate.
+func (m *Model) bufferDeltas(evs []adkEvent) {
+	for _, ae := range evs {
+		ev := ae.ev
+		if ev == nil || ev.Content == nil {
+			continue
+		}
+		for _, p := range ev.Content.Parts {
+			if p.Thought {
+				m.thinkingBuffer.WriteString(p.Text)
+			} else if p.Text != "" {
+				m.streamBuffer.WriteString(p.Text)
+			}
+		}
+	}
+}
+
 // flushStream moves buffered streaming deltas into the live assistant slot.
+// It renders only the small tail chunk each batch: completed chunks and the
+// whole session history are cached, so per-batch cost is O(chunk), not
+// O(session) — which is what made rendering slow as sessions grew.
 func (m *Model) flushStream() {
+	if m.stats != nil {
+		start := time.Now()
+		defer func() { m.stats.add(statFlush, time.Since(start)) }()
+	}
 	content := m.streamBuffer.String()
 	m.streamBuffer.Reset()
 	thinking := m.thinkingBuffer.String()
@@ -368,10 +490,22 @@ func (m *Model) flushStream() {
 	if content == "" && thinking == "" {
 		return
 	}
-	m.assistantContent += content
-	m.assistantThinking += thinking
-	m.pendingAssistant = true
-	m.renderAll()
+	m.assistantActive = true
+	if content != "" {
+		m.assistantChunks.append(m.md, content)
+		m.assistantChunks.render(m.md)
+	}
+	if thinking != "" {
+		m.assistantThinking.append(m.md, thinking)
+		m.assistantThinking.render(m.md)
+	}
+	// Once the model emits visible text, freeze the thinking block as a stable
+	// part ABOVE the response, so newly finalized paragraphs stay visible
+	// instead of being pushed out of view by the tall live thinking block (the
+	// "every paragraph wipes the previous text" bug).
+	if content != "" && !m.thinkingFrozen && m.assistantThinking.raw.Len() > 0 {
+		m.freezeThinking()
+	}
 	m.updateViewport()
 }
 
@@ -382,9 +516,6 @@ func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 	m.streaming = false
 	m.cancel = nil
 	m.adkCh = nil
-	m.pendingAssistant = false
-	m.assistantContent = ""
-	m.assistantThinking = ""
 	m.streamBuffer.Reset()
 	m.thinkingBuffer.Reset()
 	if m.confirming {
@@ -392,7 +523,13 @@ func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if !m.cancelled && !m.streamFailed {
+		// Normal completion: the final event was already rendered once by
+		// handleADK; the streaming slot was cleared there too.
 		m.renderAll()
+	} else {
+		// Cancelled/failed: keep the streamed text on screen by finalizing
+		// the in-flight tail chunk.
+		m.assistantChunks.render(m.md)
 	}
 	m.updateViewport()
 	return m, nil
@@ -662,6 +799,12 @@ func (m Model) newSession() (tea.Model, tea.Cmd) {
 	m.events = nil
 	m.rendered = nil
 	m.ephemeral = nil
+	m.assistantActive = false
+	m.assistantChunks.reset()
+	m.assistantThinking.reset()
+	m.thinkingBlock = ""
+	m.thinkingFrozen = false
+	m.resetView()
 	m.status = "new session started"
 	m.updateViewport()
 	return m, nil
@@ -797,17 +940,142 @@ func (m *Model) addInfo(md string) {
 
 // --- rendering -----------------------------------------------------------
 
-// renderAll rebuilds the cached ANSI history from the collected events, plus
-// any in-flight streaming assistant slot.
+// renderAll rebuilds the cached ANSI history from the collected events. It is
+// only used on rare full refreshes (resize, /new, thinking toggle); the hot
+// streaming path appends completed events and chunks incrementally instead.
 func (m *Model) renderAll() {
 	m.rendered = m.rendered[:0]
 	for _, ev := range m.events {
 		m.rendered = append(m.rendered, m.renderEvent(ev))
 	}
-	if m.pendingAssistant {
-		m.rendered = append(m.rendered, m.renderAssistant(m.assistantContent, m.assistantThinking))
-	}
+	m.resetView()
 	m.updateViewport()
+}
+
+// assistantChunkCap bounds the re-rendered streaming tail chunk: each batch
+// only re-renders up to this many chars, keeping the single-threaded Bubble
+// Tea loop responsive on slow (RPi 1) hardware regardless of message size.
+const assistantChunkCap = 600
+
+// streamChunker incrementally renders a growing stream: completed chunks are
+// rendered once and cached; only the small tail chunk is re-rendered per
+// batch. Per-batch cost is O(chunk), not O(message). Text chunks use glamour
+// (markdown); the thinking streamer uses a lipgloss renderer instead.
+type streamChunker struct {
+	chunks      []string            // rendered ANSI of completed chunks
+	partial     *strings.Builder    // raw text of the in-flight tail chunk
+	partialR    string              // ANSI render of the tail chunk
+	raw         *strings.Builder    // full raw text, for one-shot re-chunks (resize)
+	renderChunk func(string) string // optional chunk renderer (defaults to glamour)
+}
+
+func newStreamChunker() *streamChunker {
+	return &streamChunker{
+		partial: &strings.Builder{},
+		raw:     &strings.Builder{},
+	}
+}
+
+// newStreamChunkerWith uses a custom chunk renderer instead of glamour, e.g.
+// for thinking text which is styled with a lipgloss block.
+func newStreamChunkerWith(render func(string) string) *streamChunker {
+	c := newStreamChunker()
+	c.renderChunk = render
+	return c
+}
+
+func (c *streamChunker) reset() {
+	c.chunks = nil
+	c.partial.Reset()
+	c.partialR = ""
+	c.raw.Reset()
+}
+
+func (c *streamChunker) append(md *markdownRenderer, text string) {
+	c.raw.WriteString(text)
+	c.appendRaw(md, text)
+}
+
+func (c *streamChunker) appendRaw(md *markdownRenderer, text string) {
+	c.partial.WriteString(text)
+	raw := c.partial.String()
+	for {
+		n := assistantChunkBoundary(raw, assistantChunkCap)
+		if n <= 0 {
+			break
+		}
+		chunk := raw[:n]
+		c.chunks = append(c.chunks, c.renderOne(md, chunk))
+		raw = raw[n:]
+	}
+	c.partial.Reset()
+	c.partial.WriteString(raw)
+}
+
+// render re-renders the tail chunk — the only per-batch render work.
+func (c *streamChunker) render(md *markdownRenderer) {
+	c.partialR = c.renderOne(md, c.partial.String())
+}
+
+// rechunk re-renders the whole stream from raw text, e.g. after the terminal
+// is resized and the renderer's wrap width changed.
+func (c *streamChunker) rechunk(md *markdownRenderer) {
+	raw := c.raw.String()
+	c.chunks = nil
+	c.partial.Reset()
+	c.partialR = ""
+	c.appendRaw(md, raw)
+	c.render(md)
+}
+
+// renderOne renders one chunk with the custom renderer, or glamour by default.
+func (c *streamChunker) renderOne(md *markdownRenderer, s string) string {
+	if c.renderChunk != nil {
+		return c.renderChunk(s)
+	}
+	out, err := md.Render(s)
+	if err != nil {
+		return strings.TrimRight(s, "\n")
+	}
+	return out
+}
+
+// assistantChunkBoundary returns the byte index just past the longest stable
+// prefix of s (bounded by cap), or -1 when no stable boundary exists yet. A
+// stable prefix ends at a blank line outside a code fence — a safe place to
+// finalize a markdown block — or at the hard chunk cap.
+func assistantChunkBoundary(s string, cap int) int {
+	if s == "" {
+		return -1
+	}
+	limit := len(s)
+	if limit > cap {
+		limit = cap
+	}
+	best := -1
+	inFence := false
+	idx := 0
+	for idx < limit {
+		nl := strings.IndexByte(s[idx:limit], '\n')
+		if nl < 0 {
+			break
+		}
+		lineEnd := idx + nl
+		trimmed := strings.TrimSpace(s[idx:lineEnd])
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+		} else if !inFence && trimmed == "" {
+			best = lineEnd + 1
+		}
+		idx = lineEnd + 1
+	}
+	if best > 0 {
+		return best
+	}
+	if len(s) > cap {
+		return limit
+	}
+	return -1
 }
 
 func (m *Model) renderEvent(ev *session.Event) string {
@@ -958,7 +1226,15 @@ func (m *Model) renderMD(md string) string {
 // toggleThinking flips thinking-block visibility (Pi-style: ctrl+t).
 func (m Model) toggleThinking() (tea.Model, tea.Cmd) {
 	m.showThinking = !m.showThinking
-	m.refresh()
+	if m.thinkingFrozen && m.assistantThinking != nil && m.assistantThinking.raw.Len() > 0 {
+		// The thinking was already frozen into a stable block above the
+		// response; re-render it for the new visibility state.
+		m.thinkingBlock = m.renderThinkingBlock()
+		m.resetView()
+		m.updateViewport()
+	} else {
+		m.refresh()
+	}
 	if m.showThinking {
 		m.status = "thinking visible — ctrl+t to hide"
 	} else {
@@ -974,12 +1250,124 @@ func (m *Model) refresh() {
 	m.updateViewport()
 }
 
-func (m *Model) updateViewport() {
-	parts := make([]string, 0, len(m.rendered)+len(m.ephemeral))
+// stableParts lists every piece of completed (frozen) content in display
+// order: completed events, the frozen thinking block (if any), finalized
+// streaming chunks, and ephemeral blocks.
+func (m *Model) stableParts() []string {
+	n := len(m.rendered) + len(m.ephemeral) + len(m.assistantChunks.chunks)
+	if m.thinkingBlock != "" {
+		n++
+	}
+	parts := make([]string, 0, n)
 	parts = append(parts, m.rendered...)
+	if m.thinkingBlock != "" {
+		parts = append(parts, m.thinkingBlock)
+	}
+	parts = append(parts, m.assistantChunks.chunks...)
 	parts = append(parts, m.ephemeral...)
-	m.viewport.SetContent(strings.Join(parts, "\n\n"))
-	m.viewport.GotoBottom()
+	return parts
+}
+
+// renderThinkingBlock renders the streamed thinking (a dimmed header plus,
+// when shown, the chunked reasoning body). Used both for the live tail and
+// for the frozen stable block once the response text starts.
+func (m *Model) renderThinkingBlock() string {
+	if m.assistantThinking == nil || m.assistantThinking.raw.Len() == 0 {
+		return ""
+	}
+	header := "▶ thinking — ctrl+t to show"
+	if m.showThinking {
+		header = "▼ thinking"
+	}
+	var sb strings.Builder
+	sb.WriteString(ui.thinkingHeader.Render(header))
+	if m.showThinking {
+		body := append(append([]string{}, m.assistantThinking.chunks...), m.assistantThinking.partialR)
+		sb.WriteString("\n")
+		sb.WriteString(strings.Join(body, "\n\n"))
+	}
+	return sb.String()
+}
+
+// freezeThinking moves the streamed thinking into a stable block that sits
+// above the response text, then drops it from the live tail. The view is
+// rebuilt once so the block lands in the correct display order.
+func (m *Model) freezeThinking() {
+	m.thinkingBlock = m.renderThinkingBlock()
+	m.thinkingFrozen = true
+	m.resetView()
+}
+
+// streamTail is the live (bounded) part of the streaming assistant slot: the
+// thinking block (until frozen) plus the current tail chunk render. Thinking
+// is chunked too, so only its small tail is re-rendered per batch — re-
+// rendering all of it (as before) made ctrl+t quadratic while a model reasoned.
+func (m *Model) streamTail() string {
+	var parts []string
+	if !m.thinkingFrozen {
+		if tb := m.renderThinkingBlock(); tb != "" {
+			parts = append(parts, tb)
+		}
+	}
+	if m.assistantChunks.partialR != "" {
+		parts = append(parts, m.assistantChunks.partialR)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// resetView discards the view line cache so the next updateViewport performs a
+// full rebuild. Called on rare full refreshes (resize, /new, thinking toggle,
+// stream completion) where the stable content changed shape.
+func (m *Model) resetView() {
+	m.viewCommitted = 0
+	m.conv.reset()
+}
+
+// updateViewport keeps the line viewer in sync with the model. Completed
+// content is appended once (O(delta)); the live streaming tail is replaced in
+// place each tick (O(tail)). This replaced bubbles/viewport.SetContent, which
+// re-split the whole conversation on every 50ms tick.
+func (m *Model) updateViewport() {
+	if m.stats != nil {
+		start := time.Now()
+		defer func() { m.stats.add(statViewport, time.Since(start)) }()
+	}
+	stable := m.stableParts()
+	if m.viewCommitted > len(stable) {
+		// Stable content shrank (chunks replaced by the final event, /new, ...).
+		m.viewCommitted = 0
+		m.conv.reset()
+	}
+	for i := m.viewCommitted; i < len(stable); i++ {
+		m.conv.appendStable(stable[i]) // O(delta): only new parts are appended
+	}
+	m.viewCommitted = len(stable)
+	if m.assistantActive {
+		m.conv.setLive(m.streamTail())
+	} else {
+		m.conv.clearLive()
+	}
+	// setLive/clamp keep the user's scroll position; when at the bottom
+	// (yOff == 0) new content naturally keeps the view pinned to the bottom.
+	// No forced gotoBottom here, so scrollback survives streaming.
+}
+
+// scroll handles the streaming scrollback keys (up/down/pgup/pgdown/home/end).
+func (m *Model) scroll(k string) {
+	switch k {
+	case "up":
+		m.conv.scrollUp(1)
+	case "down":
+		m.conv.scrollDown(1)
+	case "pgup":
+		m.conv.pageUp()
+	case "pgdown":
+		m.conv.pageDown()
+	case "home":
+		m.conv.gotoTop()
+	case "end":
+		m.conv.gotoBottom()
+	}
 }
 
 func (m *Model) rebuildRenderer() {
@@ -996,20 +1384,23 @@ func (m *Model) layout() {
 		statusH   = 1
 		composerH = 3
 	)
-	w := maxInt(m.width-4, 20)
 	vpH := maxInt(m.height-headerH-composerH-statusH, 1)
-	m.viewport.Width = w
-	m.viewport.Height = vpH
+	m.conv.height = vpH
 	m.textarea.SetWidth(maxInt(m.width-6, 20))
 	m.textarea.SetHeight(composerH - 1)
 }
 
-// View composes the screen.
+// View composes the screen. Bubble Tea calls this after every message, so it
+// is a hot path worth measuring with GARESS_STATS=1.
 func (m Model) View() string {
+	if m.stats != nil {
+		start := time.Now()
+		defer func() { m.stats.add(statView, time.Since(start)) }()
+	}
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		m.header(),
-		m.viewport.View(),
+		m.conv.view(),
 		m.composer(),
 		m.statusLine(),
 	)
