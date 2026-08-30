@@ -1,0 +1,22 @@
+# AGENTS.md — internal/harness
+
+Wires a config provider into a Google ADK agent + runner.
+
+- `Build(pc config.Provider, opts Options)` builds: the chat-completions
+  `model.LLM` (or `opts.Model` in tests), the built-in functiontools
+  (`tools.BuildTools`), an `llmagent` with `InstructionProvider` (reads the
+  shared `Preamble`), `tools.DenyCallback` (deny policy), and an
+  iteration-cap `BeforeModelCallback`. `opts.Preamble` is a `func() (string,
+  error)`; use `Preamble.Get` so `/agents reload` works without rebuilding.
+- `Preamble` is a thread-safe holder for the system-instruction text
+  (AGENTS.md/SYSTEM.md + skills).
+- The iteration cap counts model calls per invocation via a `temp:garessModelCalls`
+  state key (the session service strips `temp:` keys on persist). `Run` for an
+  `llmagent` root goes through ADK's node runtime internally — that is the
+  supported path.
+- Session service, app name (`harness.AppName = "garess"`), and
+  auto-create-session are configured here. The runner persists events; the
+  TUI only renders them.
+- Tests (`harness_test.go`) drive the full loop against an `httptest` fake
+  endpoint: text, tool call → execute → feed back, and the HITL confirmation
+  two-`Run` round trip.

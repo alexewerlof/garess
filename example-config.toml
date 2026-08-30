@@ -1,0 +1,40 @@
+# garess configuration
+#
+# Discovered in this order (project overrides global):
+#   1. global   ~/.config/garess/config.toml  (or $XDG_CONFIG_HOME/garess)
+#   2. project  .garess/config.toml
+#   3. root     config.toml                   (fallback when #2 is absent)
+#
+# Or point at a specific file with: garess --config <path>
+#
+# The API key may be omitted and provided via the GA_RESS_API_KEY environment
+# variable, which takes precedence over the value in this file.
+#
+# Endpoints must include the /v1 prefix (llama.cpp, DeepSeek and OpenRouter
+# all expose the OpenAI-compatible API under /v1).
+
+default_provider = "llamacpp"
+
+[[providers]]
+name = "llamacpp"
+endpoint = "http://127.0.0.1:8080/v1"   # local llama.cpp server
+api_key = ""                            # llama.cpp needs no key
+model = "qwen2.5-1.5b-instruct"
+
+[[providers]]
+name = "deepseek"
+endpoint = "https://api.deepseek.com/v1"
+api_key = "sk-..."                      # or use GA_RESS_API_KEY
+model = "deepseek-chat"
+
+[[providers]]
+name = "openrouter"
+endpoint = "https://openrouter.ai/api/v1"
+api_key = "sk-or-..."
+model = "deepseek/deepseek-chat"
+
+[tui]
+theme = "dark"                          # auto | dark | light
+
+[session]
+history_limit = 40                      # messages kept in the model context

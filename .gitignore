@@ -1,0 +1,11 @@
+# build output
+/dist/
+
+# local harness state
+/.garess/
+
+# project-root config (may contain API keys)
+/config.toml
+
+# logs
+*.log
