@@ -57,6 +57,28 @@ Key rules (each one caused a real bug):
   visible. Scrollback works both during and after streaming: page keys always
   scroll; arrows scroll when the conversation overflows the viewport, otherwise
   they edit the composer.
+- **Per-frame lipgloss is the enemy (2026-09-02, Pi 1 measured).** Three
+  separate O(frame) lipgloss costs were found and removed from the per-key
+  path; do not reintroduce them:
+  1. `lipgloss.JoinVertical` in `Model.View()` — re-measures the ANSI width of
+     EVERY conversation line and re-pads the frame to a common width per call
+     (~580µs of a 595µs View on a desktop; ~90ms/frame on a Pi 1). `View()` now
+     does `strings.Join(header, conv, composer, status, "\n")` (left-aligned;
+     an empty block still contributes one blank line, like JoinVertical).
+  2. `lipgloss.NewStyle().Height(h).Render(...)` in `convView.view()` for the
+     short-content case — a `Height` style makes lipgloss run its horizontal
+     re-align pass (`alignTextHorizontal`), measuring/padding every line every
+     frame. That fired whenever the conversation was shorter than the viewport
+     (the normal chat case on tall terminals) and cost tens of ms/frame on the
+     Pi. Short content is now padded with plain `strings.Repeat("\n", …)`.
+  3. The composer (`textarea.View()` + `ui.composer.Render(...)`) is the last
+     remaining per-key cost (~13–17ms on a Pi 1 at 118 cols; bubbles textarea
+     re-renders through lipgloss + viewport with per-line width measurement
+     every frame). Fixing it would require forking/replacing the bubbles
+     textarea render (its position state is unexported); GARESS_STATS buckets
+     (`view` + `tui-stats-view` hdr/conv/comp/status) are the measuring tools.
+     Rule of thumb: anything that makes lipgloss measure or pad an already-built
+     block on every frame is O(frame) and will hurt on the Pi.
 
 - **HITL confirmation.** When a run yields an `adk_request_confirmation`
   FunctionCall, the run ends; `enterConfirmation` records the wrapper IDs and
@@ -84,7 +106,7 @@ Key rules (each one caused a real bug):
   shared `harness.Preamble` (read by the agent's InstructionProvider every
   run); `/agents reload` / `/skills reload` just update it — no rebuild.
 - **Commands.** Slash commands live in `handleCommand`: `/help /new /quit
-  /model /notes /agents /skills /tools`. Add new ones there and to `helpText`.
+/model /notes /agents /skills /tools`. Add new ones there and to `helpText`.
 
 Testing: see `model_test.go`. Run programs with
 `tea.NewProgram(m, tea.WithInput(blockingReader{}), tea.WithOutput(io.Discard))`

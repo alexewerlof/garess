@@ -195,6 +195,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleADK(msg)
 
 	case tea.KeyMsg:
+		if m.stats != nil {
+			// Keystroke handling cost (textarea, scroll, commands). Together
+			// with statView this is OUR per-key CPU — Bubble Tea's renderer
+			// quantization (~16ms @ 60fps) is on top and is not measured here.
+			start := time.Now()
+			mm, cmd := m.handleKey(msg)
+			m.stats.add(statInput, time.Since(start))
+			return mm, cmd
+		}
 		return m.handleKey(msg)
 
 	default:
@@ -1393,17 +1402,36 @@ func (m *Model) layout() {
 // View composes the screen. Bubble Tea calls this after every message, so it
 // is a hot path worth measuring with GARESS_STATS=1.
 func (m Model) View() string {
-	if m.stats != nil {
-		start := time.Now()
-		defer func() { m.stats.add(statView, time.Since(start)) }()
+	if m.stats == nil {
+		return strings.Join([]string{m.header(), m.conv.view(), m.composer(), m.statusLine()}, "\n")
 	}
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		m.header(),
-		m.conv.view(),
-		m.composer(),
-		m.statusLine(),
-	)
+	start := time.Now()
+	defer func() { m.stats.add(statView, time.Since(start)) }()
+	// Per-component timing (tui-stats-view) — on a slow CPU this shows whether
+	// View() is dominated by the composer, the conversation join, etc.
+	t0 := time.Now()
+	hdr := m.header()
+	m.stats.addViewPart(viewPartHeader, time.Since(t0))
+	t0 = time.Now()
+	cv := m.conv.view()
+	m.stats.addViewPart(viewPartConv, time.Since(t0))
+	t0 = time.Now()
+	comp := m.composer()
+	m.stats.addViewPart(viewPartComposer, time.Since(t0))
+	t0 = time.Now()
+	st := m.statusLine()
+	m.stats.addViewPart(viewPartStatus, time.Since(t0))
+	// Left-aligned frame stack. Do NOT use lipgloss.JoinVertical here: it
+	// splits every block, re-measures the ANSI display width of EVERY line
+	// and re-pads the whole frame to a common width on every call — O(frame)
+	// per keystroke (~580µs of the ~600µs View on a desktop; ~90ms/frame on a
+	// Pi 1 per GARESS_STATS, scaling with conversation size). Nothing in this
+	// layout needs a shared width (all blocks are left-aligned and the
+	// terminal erases to end-of-line when lines are repainted), so trailing
+	// padding is invisible. strings.Join reproduces JoinVertical's line
+	// structure exactly (an empty block still contributes one blank line,
+	// matching strings.Split("", "\n")) without any width math.
+	return strings.Join([]string{hdr, cv, comp, st}, "\n")
 }
 
 func (m Model) header() string {

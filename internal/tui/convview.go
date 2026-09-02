@@ -2,8 +2,6 @@ package tui
 
 import (
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // convView is a bottom-anchored, append-only line viewer for the conversation.
@@ -101,8 +99,18 @@ func (v *convView) view() string {
 	for i := start; i < end; i++ {
 		window = append(window, v.lineAt(i))
 	}
+	joined := strings.Join(window, "\n")
 	if len(window) >= v.height {
-		return strings.Join(window, "\n")
+		return joined
 	}
-	return lipgloss.NewStyle().Height(v.height).Render(strings.Join(window, "\n"))
+	// Content is shorter than the viewport: pad with plain newlines so the
+	// composer stays anchored at the bottom. Do NOT use
+	// lipgloss.NewStyle().Height(v.height).Render(...) here — a Height style
+	// makes lipgloss run its horizontal re-align pass (alignTextHorizontal),
+	// which measures the ANSI width of EVERY line and re-pads them all, every
+	// frame. That is O(frame) per View and ~100x a plain join; on a Pi 1 it
+	// cost tens of ms per frame whenever the conversation was shorter than the
+	// terminal (GARESS_STATS `conv` bucket, e.g. 32-42ms at 180x45). Blank
+	// padding lines are equivalent on screen.
+	return joined + strings.Repeat("\n", v.height-len(window))
 }
