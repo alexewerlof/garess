@@ -29,11 +29,11 @@ account.
 The policy is a set of Go regular expressions read from environment
 variables at startup:
 
-| Variable | Meaning |
-| --- | --- |
-| `GARESS_TOOL_DENY` | calls matching these regexes are blocked |
-| `GARESS_TOOL_ASK` | calls matching these regexes request a `y`/`n` in the TUI |
-| `GARESS_TOOL_ALLOW` | calls matching these regexes run without confirmation |
+| Variable            | Meaning                                                   |
+| ------------------- | --------------------------------------------------------- |
+| `GARESS_TOOL_DENY`  | calls matching these regexes are blocked                  |
+| `GARESS_TOOL_ASK`   | calls matching these regexes request a `y`/`n` in the TUI |
+| `GARESS_TOOL_ALLOW` | calls matching these regexes run without confirmation     |
 
 Precedence is **deny > ask > allow**. Two more rules matter:
 
@@ -84,7 +84,7 @@ you configure; they are a policy layer, not a sandbox.
 
 The sandbox (see [Configuration](configuration.md#sandbox)) uses the Linux
 Landlock LSM to confine **writes** of the whole process — the in-process file
-tools *and* every `bash` child:
+tools _and_ every `bash` child:
 
 - **Confined:** creating, writing, truncating, removing files and dirs,
   creating sockets/fifos/symlinks — allowed only under the writable
@@ -98,7 +98,7 @@ Limits to know:
 
 - It is **write confinement**, not a full container. A malicious model can
   still read anything your user can read and execute anything your user can
-  execute; the sandbox only stops it from *modifying* files outside the
+  execute; the sandbox only stops it from _modifying_ files outside the
   allowlist.
 - It needs **Landlock ABI ≥ 6** (Linux ≥ 6.7). Desktop distros from ~2024
   qualify. Raspberry Pi OS armv6 (`rpi-v6`) kernels have Landlock disabled
@@ -116,7 +116,7 @@ Limits to know:
   the primary actor; the controls above only bound what it may do.
 - Keep your config private (`chmod 600`); it can contain API keys.
 - Remember the tool approval policy applies to **tool calls**, and the
-  sandbox to **writes**. Neither stops the model from *reading* files, and
+  sandbox to **writes**. Neither stops the model from _reading_ files, and
   both are irrelevant to plain (non-tool) chat.
 - Run garess as an unprivileged user, ideally in a directory you are happy
   for it to modify.

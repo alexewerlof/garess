@@ -20,11 +20,11 @@ overridden wholesale, with per-event and per-list semantics documented below.
 
 ## Environment variables
 
-| Variable | Effect |
-| --- | --- |
-| `GA_RESS_API_KEY` | API key; wins over the `api_key` config field |
-| `GARESS_TOOL_ALLOW` / `GARESS_TOOL_ASK` / `GARESS_TOOL_DENY` | tool approval regexes (`;`-separated) — see [Safety model](safety.md) |
-| `GARESS_SANDBOX` | override the `[sandbox] backend` for one run (`none`/`auto`/`landlock`) |
+| Variable                                                     | Effect                                                                  |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `GA_RESS_API_KEY`                                            | API key; wins over the `api_key` config field                           |
+| `GARESS_TOOL_ALLOW` / `GARESS_TOOL_ASK` / `GARESS_TOOL_DENY` | tool approval regexes (`;`-separated) — see [Safety model](safety.md)   |
+| `GARESS_SANDBOX`                                             | override the `[sandbox] backend` for one run (`none`/`auto`/`landlock`) |
 
 ## Top level
 

@@ -41,10 +41,10 @@ Finish changes with `go build ./... && go test ./...`; keep `gofmt` clean
 | `internal/config/`  | TOML config, XDG paths, merge, typed errors                                           |
 | `internal/harness/` | ADK agent + runner wiring (tools, policy, hooks plugin)                               |
 | `internal/hooks/`   | Git-style shell hooks (config `[[hooks]]`, ADK plugin, exit-code abort)               |
-| `internal/llm/`     | Custom ADK `model.LLM` over OpenAI-compatible chat completions (no SDK) |
+| `internal/llm/`     | Custom ADK `model.LLM` over OpenAI-compatible chat completions (no SDK)               |
 | `internal/memory/`  | Local + global memory notes                                                           |
 | `internal/sandbox/` | Landlock tool sandbox (Phase 4): write confinement, none/auto/landlock backends       |
-| `internal/skills/` | Skill pack discovery + rendering (user/project/launch-dir roots)                          |
+| `internal/skills/`  | Skill pack discovery + rendering (user/project/launch-dir roots)                      |
 | `internal/tui/`     | Bubble Tea UI (model, streaming, markdown, commands)                                  |
 
 Each package has its own `AGENTS.md` with its specific conventions — read the
@@ -121,10 +121,9 @@ one in the folder you are editing.
   tool and model events. Hooks run via `sh -c` with the event name as `$1`
   and a JSON payload on stdin; `before*\*`hooks abort on non-zero exit.
 Config validation of event names/timeouts happens in`hooks.Parse`;
-`garess doctor` lists configured hooks. `after_model` and `on_event` fire only
+`garess doctor`lists configured hooks.`after_model`and`on_event`fire only
 on non-partial (completed) responses — once per model generation, never per
-streamed token. Hook timeouts kill the whole `sh` process group (Setpgid +
-`cmd.Cancel` group kill), so an orphaned child cannot outlive the timeout.
+streamed token. Hook timeouts kill the whole`sh`process group (Setpgid +`cmd.Cancel` group kill), so an orphaned child cannot outlive the timeout.
 - Phase 4 — implemented: Landlock sandboxing for tools (`internal/sandbox`,
   `[sandbox]` config, pluggable `none`/`auto`/`landlock` backends). Whole-
   process write confinement via `landlock_restrict_self(TSYNC)` (ABI >= 6);

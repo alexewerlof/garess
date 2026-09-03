@@ -54,20 +54,20 @@ The TUI never writes to the session service directly. It pumps ADK
 
 ## Package map
 
-| Package | Responsibility | Depends on |
-| --- | --- | --- |
-| `cmd/garess` | CLI, flags, `doctor`, startup wiring | everything |
-| `internal/config` | TOML config, XDG paths, merge, typed errors | — |
-| `internal/agents` | AGENTS.md/SYSTEM.md discovery + rendering | — |
-| `internal/skills` | skill discovery + rendering | `internal/agents` |
-| `internal/memory` | markdown memory notes (local + global) | — |
-| `internal/llm` | custom ADK `model.LLM` over OpenAI chat-completions | — |
-| `internal/chat` | ADK `session.Service` over JSONL transcripts | — |
-| `internal/tools` | built-in functiontools + allow/ask/deny policy | `internal/memory` |
-| `internal/hooks` | git-style shell hooks as an ADK plugin | `internal/config` |
-| `internal/sandbox` | Landlock write sandbox (`none`/`auto`/`landlock`) | `internal/config` |
-| `internal/harness` | wires one provider into ADK agent + runner | config, hooks, llm, memory, tools |
-| `internal/tui` | Bubble Tea UI; pumps runner events | agents, chat, harness, memory, skills, tools |
+| Package            | Responsibility                                      | Depends on                                   |
+| ------------------ | --------------------------------------------------- | -------------------------------------------- |
+| `cmd/garess`       | CLI, flags, `doctor`, startup wiring                | everything                                   |
+| `internal/config`  | TOML config, XDG paths, merge, typed errors         | —                                            |
+| `internal/agents`  | AGENTS.md/SYSTEM.md discovery + rendering           | —                                            |
+| `internal/skills`  | skill discovery + rendering                         | `internal/agents`                            |
+| `internal/memory`  | markdown memory notes (local + global)              | —                                            |
+| `internal/llm`     | custom ADK `model.LLM` over OpenAI chat-completions | —                                            |
+| `internal/chat`    | ADK `session.Service` over JSONL transcripts        | —                                            |
+| `internal/tools`   | built-in functiontools + allow/ask/deny policy      | `internal/memory`                            |
+| `internal/hooks`   | git-style shell hooks as an ADK plugin              | `internal/config`                            |
+| `internal/sandbox` | Landlock write sandbox (`none`/`auto`/`landlock`)   | `internal/config`                            |
+| `internal/harness` | wires one provider into ADK agent + runner          | config, hooks, llm, memory, tools            |
+| `internal/tui`     | Bubble Tea UI; pumps runner events                  | agents, chat, harness, memory, skills, tools |
 
 ## Key design decisions
 
@@ -107,13 +107,13 @@ the fallback path exists.
 performance story, each documented as a hard-won rule in
 `internal/tui/AGENTS.md`:
 
-1. *Coalescing*: streamed deltas are batched on a fixed cadence so Bubble Tea
+1. _Coalescing_: streamed deltas are batched on a fixed cadence so Bubble Tea
    does ~20 renders/second during streaming, not one per token.
-2. *Incremental rendering*: completed events and finalized markdown chunks are
+2. _Incremental rendering_: completed events and finalized markdown chunks are
    rendered once and cached; only a small live tail is re-rendered per frame.
    `renderAll()` (full re-glamour) is reserved for resize, `/new`, and
    `ctrl+t`.
-3. *No per-frame lipgloss on big blocks*: `View()` joins strings instead of
+3. _No per-frame lipgloss on big blocks_: `View()` joins strings instead of
    `lipgloss.JoinVertical`, and the conversation viewer (`convView`) pads with
    plain newlines instead of a `Height` style — both were O(frame) lipgloss
    passes that dominated per-keystroke latency on the Pi.
@@ -124,16 +124,16 @@ only exists on the v1 API. This is a deliberate, documented constraint.
 
 ## Data and file layout at runtime
 
-| Path | Contents |
-| --- | --- |
-| `~/.config/garess/config.toml` | global config |
-| `~/.config/garess/memory/` | global memory notes (`<name>.md`) |
-| `~/.config/garess/garess.log` | structured logs (TUI owns stdout) |
-| `.garess/config.toml` | project config overlay |
-| `.garess/memory/` | project memory notes |
-| `.garess/sessions/<id>.jsonl` | session transcript (one event per line) |
-| `.garess/sessions/<id>.meta.json` | session metadata |
-| `<launchdir>/AGENTS.md`, `SYSTEM.md` | project instruction files (injected) |
+| Path                                      | Contents                                   |
+| ----------------------------------------- | ------------------------------------------ |
+| `~/.config/garess/config.toml`            | global config                              |
+| `~/.config/garess/memory/`                | global memory notes (`<name>.md`)          |
+| `~/.config/garess/garess.log`             | structured logs (TUI owns stdout)          |
+| `.garess/config.toml`                     | project config overlay                     |
+| `.garess/memory/`                         | project memory notes                       |
+| `.garess/sessions/<id>.jsonl`             | session transcript (one event per line)    |
+| `.garess/sessions/<id>.meta.json`         | session metadata                           |
+| `<launchdir>/AGENTS.md`, `SYSTEM.md`      | project instruction files (injected)       |
 | `skills/<name>/SKILL.md` (or `README.md`) | skill packs (user, project, or launch dir) |
 
 ## Testing strategy
