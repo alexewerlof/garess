@@ -25,6 +25,7 @@ import (
 	"garess/internal/harness"
 	"garess/internal/llm"
 	"garess/internal/memory"
+	"garess/internal/sandbox"
 	"garess/internal/skills"
 	"garess/internal/tools"
 	"garess/internal/tui"
@@ -203,6 +204,7 @@ func runTUI(cfgPath, providerName, modelName string) error {
 		WorkDir:        wd,
 		SessionService: svc,
 		Policy:         tools.DefaultPolicy(),
+		Hooks:          cfg.Hooks,
 		Preamble:       preamble.Get,
 	}
 	providers := make(map[string]*harness.Provider, len(cfg.Providers))
@@ -213,6 +215,29 @@ func runTUI(cfgPath, providerName, modelName string) error {
 			return fmt.Errorf("provider %q: %w", p.Name, err)
 		}
 		providers[p.Name] = prov
+	}
+
+	// Apply the Landlock tool sandbox (Phase 4). It is process-wide and
+	// irreversible, so it runs last — after every directory garess needs has
+	// been created — and before the first user turn. GARESS_SANDBOX overrides
+	// the config backend for quick testing.
+	backend := cfg.Sandbox.Backend
+	if env := os.Getenv("GARESS_SANDBOX"); env != "" {
+		backend = env
+	}
+	sres := sandbox.Apply(sandbox.Options{
+		Backend:   backend,
+		WorkDir:   wd,
+		WriteDirs: cfg.Sandbox.WriteDirs,
+	})
+	if sres.Err != nil {
+		return fmt.Errorf("sandbox: %w", sres.Err)
+	}
+	switch {
+	case sres.Active:
+		slog.Info(sres.String())
+	case backend == sandbox.BackendLandlock || backend == sandbox.BackendAuto:
+		slog.Warn(sres.String())
 	}
 
 	model, err := tui.New(providers, current, cfg.TUI.Theme, "local", sessID, mem, preamble, wd, 0, 0)
@@ -261,7 +286,8 @@ func runDoctor(args []string) error {
 		}
 		fmt.Printf("models:     %d available (%s)\n", len(sorted), strings.Join(sample, ", "))
 	}
-	reportSandbox()
+	reportSandbox(cfg)
+	reportHooks(cfg)
 	reportAgents()
 	reportSkills()
 	return nil
@@ -277,20 +303,45 @@ func maskKey(k string) string {
 	return k[:4] + "…" + k[len(k)-4:]
 }
 
-// reportSandbox checks kernel support for the Landlock sandbox (Phase 4).
-func reportSandbox() {
+// reportSandbox reports kernel Landlock support and the configured sandbox
+// (Phase 4).
+func reportSandbox(cfg *config.Config) {
+	abi, ok := sandbox.Available()
 	fmt.Println("sandbox:")
-	lsm, err := os.ReadFile("/sys/kernel/security/lsm")
 	switch {
-	case err != nil:
-		fmt.Println("  landlock:    unknown (cannot read /sys/kernel/security/lsm)")
-	case strings.Contains(string(lsm), "landlock"):
-		fmt.Println("  landlock:    available (kernel-enforced tool sandboxing)")
+	case abi <= 0:
+		fmt.Println("  landlock:    NOT supported by this kernel — tools run unsandboxed ('none' backend)")
+	case !ok:
+		fmt.Printf("  landlock:    ABI %d available but < 6 — process-wide TSYNC needs kernel >= 6.7, tools run unsandboxed\n", abi)
 	default:
-		fmt.Println("  landlock:    NOT enabled in this kernel — tool sandboxing falls back to 'none'")
+		fmt.Printf("  landlock:    ABI %d available (process-wide write confinement)\n", abi)
 	}
 	if k, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
 		fmt.Printf("  kernel:      %s\n", strings.TrimSpace(string(k)))
+	}
+	backend := cfg.Sandbox.Backend
+	if env := os.Getenv("GARESS_SANDBOX"); env != "" {
+		backend = env + " (GARESS_SANDBOX)"
+	}
+	fmt.Printf("  backend:     %s\n", backend)
+	if len(cfg.Sandbox.WriteDirs) > 0 {
+		fmt.Printf("  write dirs:  %s\n", strings.Join(cfg.Sandbox.WriteDirs, ", "))
+	}
+}
+
+// reportHooks lists the configured git-style hooks (Phase 3).
+func reportHooks(cfg *config.Config) {
+	if len(cfg.Hooks) == 0 {
+		fmt.Println("hooks:      none configured")
+		return
+	}
+	fmt.Println("hooks:")
+	for _, h := range cfg.Hooks {
+		timeout := h.Timeout
+		if timeout == "" {
+			timeout = "10s (default)"
+		}
+		fmt.Printf("  %-16s %s  [timeout %s]\n", h.Event, h.Command, timeout)
 	}
 }
 

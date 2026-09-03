@@ -10,10 +10,12 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 
 	"garess/internal/config"
+	"garess/internal/hooks"
 	"garess/internal/llm"
 	"garess/internal/memory"
 	"garess/internal/tools"
@@ -46,6 +48,9 @@ type Options struct {
 	// MaxToolIterations caps model calls per run (default
 	// DefaultMaxToolIterations).
 	MaxToolIterations int
+	// Hooks are git-style shell hooks fired on agent/tool/model/session
+	// events. Empty means no plugin is registered. See internal/hooks.
+	Hooks []config.Hook
 	// Preamble returns the current AGENTS.md/SYSTEM.md/skills instruction
 	// text. It is re-evaluated on every run, so /agents reload just swaps the
 	// backing data.
@@ -99,11 +104,26 @@ func Build(pc config.Provider, opts Options) (*Provider, error) {
 		return nil, fmt.Errorf("harness: build agent: %w", err)
 	}
 
+	// Optional git-style shell hooks, wired into the runner as a plugin.
+	var pluginConfig runner.PluginConfig
+	if len(opts.Hooks) > 0 {
+		hs, err := hooks.Parse(opts.Hooks)
+		if err != nil {
+			return nil, fmt.Errorf("harness: hooks: %w", err)
+		}
+		hp, err := hooks.NewPlugin(hs)
+		if err != nil {
+			return nil, fmt.Errorf("harness: build hooks plugin: %w", err)
+		}
+		pluginConfig.Plugins = []*plugin.Plugin{hp}
+	}
+
 	r, err := runner.New(runner.Config{
 		AppName:           AppName,
 		Agent:             ag,
 		SessionService:    opts.SessionService,
 		AutoCreateSession: true,
+		PluginConfig:      pluginConfig,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("harness: build runner: %w", err)

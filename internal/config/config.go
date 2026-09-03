@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -57,9 +58,52 @@ type Config struct {
 	TUI TUI `toml:"tui"`
 	// Session holds conversation options.
 	Session Session `toml:"session"`
+	// Hooks are git-style shell hooks run on agent/tool/model/session events.
+	Hooks []Hook `toml:"hooks"`
+	// Sandbox holds the Landlock tool-sandbox options (Phase 4).
+	Sandbox Sandbox `toml:"sandbox"`
 
 	// Warnings are non-fatal notes collected while decoding (e.g. unknown keys).
 	Warnings []string `toml:"-"`
+}
+
+// Sandbox holds the tool-sandbox options. The sandbox kernel-enforces a
+// write allowlist over the whole garess process (tool file operations AND
+// bash children): reads and execution stay unrestricted everywhere; writes,
+// creates, removes and truncates are only permitted under the writable
+// directories. See the internal/sandbox package for the backend semantics.
+type Sandbox struct {
+	// Backend selects the enforcement backend:
+	//   - "none" (default): no sandboxing.
+	//   - "auto": use Landlock when the kernel supports it (ABI >= 6 for
+	//     process-wide TSYNC), otherwise fall back to "none".
+	//   - "landlock": require Landlock; startup fails if it cannot apply.
+	Backend string `toml:"backend"`
+	// WriteDirs are extra absolute directories the sandbox may write to,
+	// on top of the garess defaults (workdir, project state, /tmp and the
+	// global config dir). Only meaningful with a Landlock backend — useful
+	// for build caches (GOCACHE, ~/.cache, ...). Project config replaces the
+	// global list.
+	WriteDirs []string `toml:"write_dirs"`
+}
+
+// SandboxBackends lists the accepted sandbox.backend values.
+var SandboxBackends = []string{"none", "auto", "landlock"}
+
+// Hook fires a shell command when a named agent event occurs. See the
+// internal/hooks package for the event names, the invocation contract
+// (sh -c, JSON payload on stdin, argv[1] = event) and which events abort on
+// a non-zero exit.
+type Hook struct {
+	// Event is one of the internal/hooks events, e.g. "before_tool",
+	// "after_model", "on_event", "before_run".
+	Event string `toml:"event"`
+	// Command is the shell command to run (sh -c). It receives the event name
+	// as $1 and a JSON event payload on stdin.
+	Command string `toml:"command"`
+	// Timeout bounds the hook run (Go duration, e.g. "5s"). Empty means the
+	// hooks package default (10s).
+	Timeout string `toml:"timeout"`
 }
 
 // Provider describes a single OpenAI-compatible endpoint.
@@ -85,6 +129,7 @@ func Default() *Config {
 	return &Config{
 		TUI:     TUI{Theme: DefaultTheme},
 		Session: Session{HistoryLimit: DefaultHistoryLimit},
+		Sandbox: Sandbox{Backend: "none"},
 	}
 }
 
@@ -246,6 +291,34 @@ func (c *Config) Merge(over *Config) {
 	if over.Session.HistoryLimit != 0 {
 		c.Session.HistoryLimit = over.Session.HistoryLimit
 	}
+	if over.Sandbox.Backend != "" {
+		c.Sandbox.Backend = over.Sandbox.Backend
+	}
+	if len(over.Sandbox.WriteDirs) > 0 {
+		c.Sandbox.WriteDirs = over.Sandbox.WriteDirs
+	}
+	c.Hooks = mergeHooks(c.Hooks, over.Hooks)
+}
+
+// mergeHooks overlays project hooks onto global hooks: when the project
+// defines any hook for an event it replaces the global hooks for that event
+// entirely (so a project can drop a global guard); events the project does
+// not touch keep their global hooks. Order within an event is preserved.
+func mergeHooks(base, over []Hook) []Hook {
+	if len(over) == 0 {
+		return base
+	}
+	overEvents := make(map[string]bool, len(over))
+	for _, h := range over {
+		overEvents[h.Event] = true
+	}
+	out := make([]Hook, 0, len(base)+len(over))
+	for _, h := range base {
+		if !overEvents[h.Event] {
+			out = append(out, h)
+		}
+	}
+	return append(out, over...)
 }
 
 func (c *Config) applyDefaults() {
@@ -254,6 +327,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Session.HistoryLimit == 0 {
 		c.Session.HistoryLimit = DefaultHistoryLimit
+	}
+	if c.Sandbox.Backend == "" {
+		c.Sandbox.Backend = "none"
 	}
 	if c.DefaultProvider == "" && len(c.Providers) > 0 {
 		c.DefaultProvider = c.Providers[0].Name
@@ -289,6 +365,19 @@ func (c *Config) Validate() error {
 	case "auto", "dark", "light":
 	default:
 		return fmt.Errorf("tui.theme must be one of auto|dark|light, got %q", c.TUI.Theme)
+	}
+	switch c.Sandbox.Backend {
+	case "none", "auto", "landlock":
+	default:
+		return fmt.Errorf("sandbox.backend must be one of none|auto|landlock, got %q", c.Sandbox.Backend)
+	}
+	for _, d := range c.Sandbox.WriteDirs {
+		if d == "" {
+			return fmt.Errorf("sandbox.write_dirs entries must not be empty")
+		}
+		if !filepath.IsAbs(d) {
+			return fmt.Errorf("sandbox.write_dirs entry %q must be an absolute path", d)
+		}
 	}
 	return nil
 }

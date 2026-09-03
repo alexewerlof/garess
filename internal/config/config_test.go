@@ -280,3 +280,164 @@ func TestResolveAPIKeyEnv(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestSandboxDecodeDefaultsAndMerge(t *testing.T) {
+	dir := t.TempDir()
+	global := filepath.Join(dir, "global.toml")
+	project := filepath.Join(dir, "project.toml")
+
+	// Global: auto backend + one shared cache dir; project: landlock + own dirs.
+	write(t, global, `
+[[providers]]
+name = "a"
+endpoint = "https://a.example/v1"
+model = "ma"
+[sandbox]
+backend = "auto"
+write_dirs = ["/home/u/.cache"]
+`)
+	write(t, project, `
+[[providers]]
+name = "a"
+endpoint = "https://a.example/v1"
+model = "ma"
+[sandbox]
+backend = "landlock"
+write_dirs = ["/home/u/.cache", "/var/tmp"]
+`)
+
+	cfg, found, err := loadFrom(global, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected config to be found")
+	}
+	if cfg.Sandbox.Backend != "landlock" {
+		t.Fatalf("backend = %q, want landlock (project overrides)", cfg.Sandbox.Backend)
+	}
+	if len(cfg.Sandbox.WriteDirs) != 2 || cfg.Sandbox.WriteDirs[0] != "/home/u/.cache" || cfg.Sandbox.WriteDirs[1] != "/var/tmp" {
+		t.Fatalf("write_dirs = %v, want the project list", cfg.Sandbox.WriteDirs)
+	}
+
+	// Defaults apply when the section is absent.
+	cfg2, err := Default(), error(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.Sandbox.Backend != "none" {
+		t.Fatalf("default backend = %q, want none", cfg2.Sandbox.Backend)
+	}
+}
+
+func TestSandboxValidation(t *testing.T) {
+	dir := t.TempDir()
+	base := `
+[[providers]]
+name = "x"
+endpoint = "https://x.example/v1"
+model = "m"
+`
+	cases := []struct {
+		name    string
+		section string
+		want    string
+	}{
+		{"bad backend", `[sandbox]
+backend = "firejail"`, "sandbox.backend must be one of"},
+		{"relative write dir", `[sandbox]
+write_dirs = ["relative/path"]`, "must be an absolute path"},
+		{"empty write dir", `[sandbox]
+write_dirs = [""]`, "must not be empty"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(dir, "c.toml")
+			write(t, p, base+c.section)
+			_, err := Load(p)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want containing %q", err, c.want)
+			}
+		})
+	}
+
+	// Valid section loads.
+	p := filepath.Join(dir, "ok.toml")
+	write(t, p, base+`[sandbox]
+backend = "auto"
+write_dirs = ["/tmp/x"]
+`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("valid sandbox rejected: %v", err)
+	}
+}
+
+func TestHooksDecode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	write(t, p, `
+[[providers]]
+name = "x"
+endpoint = "https://x.example/v1"
+model = "m"
+
+[[hooks]]
+event = "before_tool"
+command = "guard.sh"
+
+[[hooks]]
+event = "on_event"
+command = "notify --event"
+timeout = "2s"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Hooks) != 2 {
+		t.Fatalf("got %d hooks, want 2: %+v", len(cfg.Hooks), cfg.Hooks)
+	}
+	if cfg.Hooks[0].Event != "before_tool" || cfg.Hooks[0].Command != "guard.sh" || cfg.Hooks[0].Timeout != "" {
+		t.Fatalf("hook 0 = %+v", cfg.Hooks[0])
+	}
+	if cfg.Hooks[1].Event != "on_event" || cfg.Hooks[1].Command != "notify --event" || cfg.Hooks[1].Timeout != "2s" {
+		t.Fatalf("hook 1 = %+v", cfg.Hooks[1])
+	}
+}
+
+func TestMergeHooksProjectOverridesPerEvent(t *testing.T) {
+	// Global defines two before_tool guards and an after_model notifier.
+	global := []Hook{
+		{Event: "before_tool", Command: "guard-a"},
+		{Event: "before_tool", Command: "guard-b"},
+		{Event: "after_model", Command: "notify-global"},
+	}
+	// Project redefines before_tool (drops the global guards) and adds on_event.
+	project := []Hook{
+		{Event: "before_tool", Command: "guard-project"},
+		{Event: "on_event", Command: "audit"},
+	}
+
+	got := mergeHooks(global, project)
+	wantEvents := []string{"after_model", "before_tool", "on_event"}
+	if len(got) != len(wantEvents) {
+		t.Fatalf("merged %d hooks, want %d: %+v", len(got), len(wantEvents), got)
+	}
+	for i, ev := range wantEvents {
+		if got[i].Event != ev {
+			t.Fatalf("hook %d event = %q, want %q (%+v)", i, got[i].Event, ev, got)
+		}
+	}
+	// Project's before_tool replaces BOTH global guards.
+	if got[1].Command != "guard-project" || got[1].Command == "guard-a" {
+		t.Fatalf("before_tool should be the project hook, got %+v", got[1])
+	}
+	// The untouched global after_model hook survives.
+	if got[0].Command != "notify-global" {
+		t.Fatalf("after_model should keep the global hook, got %+v", got[0])
+	}
+	// Empty project hooks leave global hooks alone.
+	if again := mergeHooks(global, nil); len(again) != len(global) {
+		t.Fatalf("nil overlay changed hooks: %+v", again)
+	}
+}
