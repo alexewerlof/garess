@@ -144,4 +144,3 @@ streamed token. Hook timeouts kill the whole `sh` process group (Setpgid +
   forks), so a timed-out hook blocked the caller — now a process-group kill +
   WaitDelay; (3) `after_model` fired once per streamed token (134 shell
   spawns per turn) — now once per model generation like `before_model`.
-  /h
