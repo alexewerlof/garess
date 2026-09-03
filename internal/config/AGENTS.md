@@ -26,4 +26,5 @@ TOML configuration loading and validation.
   none|auto|landlock and that `write_dirs` are absolute. Merge: project
   overrides backend and the whole write_dirs list when set.
 - When adding a field, keep `merge`, `applyDefaults`, `Validate`, and the
-  tests in sync, and mirror the change in `example-config.toml` and the README.
+  tests in sync, and mirror the change in `example-config.toml` and
+  `docs/configuration.md`.

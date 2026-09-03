@@ -10,6 +10,11 @@ This file is read by garess itself: running `garess` from this directory
 injects it into the model context as a system message (see
 `internal/agents/`). The project search is capped at the launch directory.
 
+Human-facing documentation lives in [`docs/`](docs/) (end-user and
+developer guides). This file and the per-package `AGENTS.md` files are the
+AI-agent navigation layer — each package's `AGENTS.md` is authoritative for
+its folder.
+
 ## Commands
 
 ```sh
@@ -17,6 +22,7 @@ make build       # host binary -> dist/garess
 make build-arm   # RPi 1 cross-compile -> dist/garess-linux-armv6 (GOARM=6)
 make test        # go test ./...
 make vet
+make fmt         # gofmt -l -w .
 make run         # go run ./cmd/garess
 make doctor      # config + endpoint + sandbox checks
 ```
@@ -35,9 +41,10 @@ Finish changes with `go build ./... && go test ./...`; keep `gofmt` clean
 | `internal/config/`  | TOML config, XDG paths, merge, typed errors                                           |
 | `internal/harness/` | ADK agent + runner wiring (tools, policy, hooks plugin)                               |
 | `internal/hooks/`   | Git-style shell hooks (config `[[hooks]]`, ADK plugin, exit-code abort)               |
-| `internal/llm/`     | OpenAI-compatible provider abstraction                                                |
+| `internal/llm/`     | Custom ADK `model.LLM` over OpenAI-compatible chat completions (no SDK) |
 | `internal/memory/`  | Local + global memory notes                                                           |
 | `internal/sandbox/` | Landlock tool sandbox (Phase 4): write confinement, none/auto/landlock backends       |
+| `internal/skills/` | Skill pack discovery + rendering (user/project/launch-dir roots)                          |
 | `internal/tui/`     | Bubble Tea UI (model, streaming, markdown, commands)                                  |
 
 Each package has its own `AGENTS.md` with its specific conventions — read the
@@ -50,7 +57,10 @@ one in the folder you are editing.
 - **Charm stack is v1**: bubbletea v1.3.10, bubbles v1.0.0, lipgloss v1.1.0,
   glamour v1.0.0 (`github.com/charmbracelet/*` paths). Do NOT "upgrade" to v2 —
   `bubbles` only exists on the v1 API, so the whole stack stays on v1.
-- `sashabaranov/go-openai` (model client), `BurntSushi/toml` (config).
+- `google.golang.org/adk/v2` v2.2.0 (agent runner, tools, plugins, session
+  types) + `google.golang.org/genai` (content types). The chat-completions
+  wire format is hand-rolled in `internal/llm` — no OpenAI SDK dependency.
+- `BurntSushi/toml` (config).
 
 ## Conventions & gotchas
 

@@ -16,8 +16,9 @@
 // once, after garess has created every directory it needs and before any user
 // turn. All-thread enforcement uses landlock_restrict_self() with
 // LANDLOCK_RESTRICT_SELF_TSYNC, which needs Landlock ABI >= 6 (kernel >= 6.7).
-// Older kernels — including the RPi bullseye 5.10 kernel, which has no
-// Landlock at all — fall back to the "none" backend.
+// Older kernels without Landlock at all — including every Raspberry Pi OS
+// armv6 `rpi-v6` kernel (verified ENOSYS on 6.18.34+rpt-rpi-v6) — fall back
+// to the "none" backend.
 package sandbox
 
 import (
