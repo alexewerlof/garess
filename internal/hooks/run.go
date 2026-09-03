@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -87,13 +86,15 @@ func runOne(parent context.Context, c Command, stdin []byte) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", c.Command, "garess-hook", c.Event)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setHookProcGroup(cmd)
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
 		}
-		// Kill the hook's whole process group (-pid), not just the shell.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// Kill the hook's whole process group, not just the shell (see
+		// setHookProcGroup); on platforms without process groups this falls
+		// back to killing the direct child.
+		return killHookProcGroup(cmd.Process.Pid)
 	}
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = append(os.Environ(), "GARESS_HOOK_EVENT="+c.Event)

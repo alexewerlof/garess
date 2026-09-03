@@ -1,0 +1,73 @@
+# GoReleaser configuration.
+#
+# The release path is .github/workflows/release.yml, which runs this on every
+# v* tag push. Local dry run before pushing:
+#
+#   goreleaser check
+#   goreleaser release --snapshot --clean   # builds into dist/ without uploading
+#
+# Assets are raw single-file binaries (formats: [binary]) named
+# garess_<version>_<os>_<arch> (e.g. garess_0.1.0_linux_armv6), plus a
+# checksums.txt. The container image is built by the separate "docker" job in
+# the workflow, not by goreleaser.
+version: 2
+
+project_name: garess
+
+builds:
+  - id: garess
+    main: ./cmd/garess
+    binary: garess
+    env:
+      - CGO_ENABLED=0
+    # -X main.version, not garess/cmd/garess.version: the Go compiler names
+    # main-package symbols "main.<name>" regardless of import path.
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+      - freebsd
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "6"
+    ignore:
+      # GOARM=6 exists for the RPi 1, which is Linux-only; keep the other
+      # platforms to 64-bit arches (Windows: amd64 + arm64).
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+      - goos: freebsd
+        goarch: arm
+
+archives:
+  - id: binaries
+    formats:
+      - binary
+    # Versionless names so releases/latest/download/<name> always points at
+    # the newest binary (e.g. garess-linux-armv6, garess-windows-amd64.exe).
+    # With formats: [binary] goreleaser appends .exe itself on Windows (do NOT
+    # add it here) and .Arch stays "arm" — GOARM is exposed as .Arm, hence the
+    # "v{{ .Arm }}" suffix for arm builds.
+    name_template: 'garess-{{ .Os }}-{{ .Arch }}{{ if eq .Arch "arm" }}v{{ .Arm }}{{ end }}'
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^Merge branch"
+      - "^Merge pull request"

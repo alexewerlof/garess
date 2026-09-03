@@ -36,6 +36,33 @@ desktop.
 
 ## Quick start
 
+Three ways to run `garess` — pick one:
+
+**Download a binary** (no tooling). Every
+[GitHub Release](https://github.com/alexewerlof/garess/releases) attaches
+static single-file binaries for Linux, macOS, Windows and FreeBSD;
+`garess-linux-armv6` is the Raspberry Pi 1 build. Linux example:
+
+```sh
+curl -sL -o garess https://github.com/alexewerlof/garess/releases/latest/download/garess-linux-amd64
+chmod +x garess
+cp example-config.toml ~/.config/garess/config.toml
+$EDITOR ~/.config/garess/config.toml   # set your provider/endpoint
+./garess doctor                        # verify config + endpoint
+./garess                               # start chatting
+```
+
+**Run the container image** (Linux, `docker` or `podman`):
+
+```sh
+docker run -it --rm \
+  -v ~/.config/garess:/home/garess/.config/garess \
+  -v "$PWD:/work" -w /work \
+  ghcr.io/alexewerlof/garess
+```
+
+**Build from source** (Go ≥ 1.26):
+
 ```sh
 git clone <this repo> && cd garess
 make build                          # -> dist/garess
@@ -48,7 +75,10 @@ $EDITOR ~/.config/garess/config.toml   # set your provider/endpoint
 On a Raspberry Pi 1: `make build-arm` produces `dist/garess-linux-armv6`
 (static, no Go needed on the Pi); copy it over and run it there.
 
-Full setup walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
+Per-platform files, checksum verification, and the full walkthrough:
+**[docs/getting-started.md](docs/getting-started.md)**. Cutting a release
+(binaries + container image) is a single tagged push — see
+**[docs/releasing.md](docs/releasing.md)**.
 
 ## Documentation
 

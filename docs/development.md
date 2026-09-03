@@ -16,15 +16,38 @@ How to build, test, measure, and contribute to `garess`. Start with
 | --- | --- |
 | `make build` | `dist/garess` (host) |
 | `make build-arm` | `dist/garess-linux-armv6` (static, `GOOS=linux GOARCH=arm GOARM=6`) |
+| `make VERSION=vX.Y.Z build` | host binary with the version stamped (`garess --version`) |
+| `make build-all` | every release asset into `dist/` (see `RELEASE_TARGETS`) |
 | `make run` | `go run ./cmd/garess` |
 | `make doctor` | `go run ./cmd/garess doctor` |
 | `make test` / `make vet` / `make fmt` | test suite / vet / gofmt |
 
 `GOARM=6` is required for the Pi 1: Go 1.21+ defaults cross-builds to
-`GOARM=7`, and ARMv5 support was dropped. The armv6 build must stay
+`GOARM=7`, and ARMv5 support was dropped. All release targets must stay
 `CGO_ENABLED=0` (why: the Landlock sandbox deliberately uses raw
 `x/sys/unix` syscalls instead of go-landlock, whose libcap/psx dependency
 needs cgo).
+
+### Cross-platform and release builds
+
+The binary also compiles for `darwin`, `windows` and `freebsd` (pure Go,
+`CGO_ENABLED=0`; the Landlock sandbox is a no-op off Linux — only the `none`
+backend exists there). Two notes for keeping those targets green:
+
+- `internal/hooks` splits its process-group code: `procgroup_unix.go`
+  (`//go:build !windows`, `Setpgid` + whole-group kill) and
+  `procgroup_windows.go` (no-op; hooks need `/bin/sh` anyway, so they are
+  effectively unsupported on Windows).
+- Version stamping uses `-X main.version=<ver>`, not the full import path —
+  the Go compiler names `main`-package symbols `main.<name>` regardless of
+  directory. `Makefile`, `.goreleaser.yml` and `Dockerfile` all share the
+  symbol; keep them in sync.
+
+Releases are cut by pushing a `v*` tag (see
+[Releasing](releasing.md)): `.github/workflows/release.yml` runs goreleaser
+(binaries + `checksums.txt` + GitHub Release) and pushes the multi-arch
+`ghcr.io/alexewerlof/garess` image. `make build-all` exists for pre-push
+smoke tests and a manual fallback.
 
 ## Testing conventions
 

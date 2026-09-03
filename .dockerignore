@@ -1,0 +1,17 @@
+# Keep the image build context (and the Dockerfile build stage) to just what
+# is needed to compile: go.mod/go.sum + source.
+.git
+.gitignore
+.github
+dist/
+.garess/
+config.toml
+*.log
+docs/
+AGENTS.md
+SYSTEM.md
+**/AGENTS.md
+Makefile
+.goreleaser.yml
+example-config.toml
+README.md

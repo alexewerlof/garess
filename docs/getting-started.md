@@ -7,7 +7,59 @@ service such as DeepSeek or OpenRouter.
 
 ## 1. Get a binary
 
-### On a normal machine (Linux)
+Pick one path: download a release (no tooling), run the container image, or
+build from source.
+
+### Option A — download a release (recommended)
+
+Static single-file binaries are attached to every
+[GitHub Release](https://github.com/alexewerlof/garess/releases). The
+`releases/latest/download/<file>` URLs below always point at the newest
+version. Verify integrity against the release's `checksums.txt`
+(`sha256sum -c checksums.txt`).
+
+| Platform | File |
+| --- | --- |
+| Linux x86-64 | `garess-linux-amd64` |
+| Linux arm64 | `garess-linux-arm64` |
+| Raspberry Pi 1 / Zero (armv6) | `garess-linux-armv6` |
+| macOS (Intel) | `garess-darwin-amd64` |
+| macOS (Apple Silicon) | `garess-darwin-arm64` |
+| Windows (experimental) | `garess-windows-amd64.exe` / `garess-windows-arm64.exe` |
+| FreeBSD amd64 / arm64 | `garess-freebsd-amd64` / `garess-freebsd-arm64` |
+
+Example (Linux):
+
+```sh
+curl -sL -o garess https://github.com/alexewerlof/garess/releases/latest/download/garess-linux-amd64
+chmod +x garess
+./garess --version
+```
+
+`garess` is a terminal app: run it over SSH or in a terminal on the device.
+
+### Option B — container image (Linux)
+
+The image `ghcr.io/alexewerlof/garess` (linux/amd64, linux/arm64 and
+linux/armv7) runs with `docker` or `podman`. Mount your config from step 2
+and a working directory — the agentic tools write there, and `.garess/`
+memory/session state lives in it too — and give it a TTY:
+
+```sh
+docker run -it --rm \
+  -v ~/.config/garess:/home/garess/.config/garess \
+  -v "$PWD:/work" -w /work \
+  ghcr.io/alexewerlof/garess
+# podman: podman run -it --rm ...   (same flags)
+```
+
+If your host uid is not 1000, add `--user $(id -u):$(id -g)` so the tools
+can write to the mounted directory. For a LAN llama.cpp server add
+`--network host` (or point the config at your host's IP). The Raspberry Pi 1
+is *not* served by the image — use the `garess-linux-armv6` binary from
+Option A.
+
+### Option C — build from source
 
 You need Go ≥ 1.26 (pure-Go dependencies, no cgo) and `make`:
 
@@ -16,18 +68,14 @@ git clone <this repo> && cd garess
 make build            # -> dist/garess
 ```
 
-### On a Raspberry Pi 1
-
-Cross-compile from your machine and copy the binary over — no Go toolchain is
-needed on the Pi:
+On a Raspberry Pi 1, cross-compile from your machine and copy the binary
+over — no Go toolchain is needed on the Pi:
 
 ```sh
 make build-arm        # -> dist/garess-linux-armv6 (static, GOARM=6)
 scp dist/garess-linux-armv6 user@rpi1:~/
 ssh user@rpi1 '~/garess-linux-armv6'
 ```
-
-`garess` is a terminal app: run it over SSH or in a terminal on the device.
 
 ## 2. Configure
 
