@@ -46,13 +46,17 @@ func (s *scriptedModel) Name() string { return s.name }
 func (s *scriptedModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
 		if len(s.turns) == 0 {
-			yield(&model.LLMResponse{Content: genai.NewContentFromText("", genai.RoleModel), TurnComplete: true}, nil)
+			if !yield(&model.LLMResponse{Content: genai.NewContentFromText("", genai.RoleModel), TurnComplete: true}, nil) {
+				return
+			}
 			return
 		}
 		final := s.turns[0]
 		s.turns = s.turns[1:]
 		if !stream {
-			yield(final, nil)
+			if !yield(final, nil) {
+				return
+			}
 			return
 		}
 		for _, p := range final.Content.Parts {
@@ -60,12 +64,18 @@ func (s *scriptedModel) GenerateContent(ctx context.Context, req *model.LLMReque
 				continue
 			}
 			if p.Thought {
-				yield(&model.LLMResponse{Content: genai.NewContentFromParts([]*genai.Part{{Text: p.Text, Thought: true}}, genai.RoleModel), Partial: true}, nil)
+				if !yield(&model.LLMResponse{Content: genai.NewContentFromParts([]*genai.Part{{Text: p.Text, Thought: true}}, genai.RoleModel), Partial: true}, nil) {
+					return
+				}
 			} else {
-				yield(&model.LLMResponse{Content: genai.NewContentFromParts([]*genai.Part{genai.NewPartFromText(p.Text)}, genai.RoleModel), Partial: true}, nil)
+				if !yield(&model.LLMResponse{Content: genai.NewContentFromParts([]*genai.Part{genai.NewPartFromText(p.Text)}, genai.RoleModel), Partial: true}, nil) {
+					return
+				}
 			}
 		}
-		yield(final, nil)
+		if !yield(final, nil) {
+			return
+		}
 	}
 }
 
@@ -117,7 +127,7 @@ func testProvider(t *testing.T, svc session.Service, policy tools.Policy, m mode
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness.Provider{Name: "fake", Model: "m", Agent: ag, Runner: r}
+	return &harness.Provider{Name: "fake", Model: "m", Agent: ag, Runner: r, LLMModel: m, SessionService: svc}
 }
 
 type testEnv struct {
@@ -142,8 +152,17 @@ func newEnv(t *testing.T) *testEnv {
 
 func newModel(t *testing.T, env *testEnv, policy tools.Policy, m model.LLM) *Model {
 	t.Helper()
+	return newModelOpts(t, env, policy, m, nil)
+}
+
+func newModelOpts(t *testing.T, env *testEnv, policy tools.Policy, m model.LLM, opts *Options) *Model {
+	t.Helper()
 	prov := testProvider(t, env.svc, policy, m, env.preamble)
-	model, err := New(map[string]*harness.Provider{"fake": prov}, "fake", "dark", "local", env.sessID, env.mem, env.preamble, t.TempDir(), 100, 30)
+	var newOpts []Options
+	if opts != nil {
+		newOpts = []Options{*opts}
+	}
+	model, err := New(map[string]*harness.Provider{"fake": prov}, "fake", "dark", "local", env.sessID, env.mem, env.preamble, t.TempDir(), 100, 30, newOpts...)
 	if err != nil {
 		t.Fatal(err)
 	}

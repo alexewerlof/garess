@@ -26,6 +26,7 @@ type styles struct {
 	composer       lipgloss.Style
 	thinkingHeader lipgloss.Style
 	thinkingBody   lipgloss.Style
+	summaryHeader  lipgloss.Style
 }
 
 var ui styles
@@ -50,4 +51,5 @@ func init() {
 		BorderForeground(lipgloss.Color(colorDim))
 	ui.thinkingHeader = base.Italic(true).Foreground(lipgloss.Color(colorDim))
 	ui.thinkingBody = base.Foreground(lipgloss.Color("240")).PaddingLeft(2)
+	ui.summaryHeader = base.Bold(true).Foreground(lipgloss.Color(colorInfo))
 }

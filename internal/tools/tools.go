@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
@@ -132,6 +133,21 @@ func output(v any) map[string]any {
 	return map[string]any{"output": v}
 }
 
+// MaxToolOutputChars caps the text a tool returns to the model, so a single
+// huge result (a chatty command, a giant file) cannot consume the whole
+// context window mid-turn. The model is told the output was truncated.
+const MaxToolOutputChars = 32_000
+
+// capOutput truncates s to MaxToolOutputChars with an explicit marker.
+func capOutput(s string) string {
+	n := utf8.RuneCountInString(s)
+	if n <= MaxToolOutputChars {
+		return s
+	}
+	return string([]rune(s)[:MaxToolOutputChars]) +
+		fmt.Sprintf("…[truncated: output exceeds %d chars, %d omitted]", MaxToolOutputChars, n-MaxToolOutputChars)
+}
+
 // BashInput is the argument schema for the bash tool.
 type BashInput struct {
 	Command string `json:"command" jsonschema:"Shell command to run with bash -lc"`
@@ -151,7 +167,7 @@ func (b *builder) bash(ctx agent.Context, in BashInput) (map[string]any, error) 
 	if err != nil {
 		return nil, fmt.Errorf("bash failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	return output(strings.TrimSpace(string(out))), nil
+	return output(capOutput(strings.TrimSpace(string(out)))), nil
 }
 
 // ReadFileInput is the argument schema for the read_file tool.
@@ -167,7 +183,7 @@ func (b *builder) readFile(ctx agent.Context, in ReadFileInput) (map[string]any,
 	if err != nil {
 		return nil, err
 	}
-	return output(string(data)), nil
+	return output(capOutput(string(data))), nil
 }
 
 // WriteFileInput is the argument schema for the write_file tool.

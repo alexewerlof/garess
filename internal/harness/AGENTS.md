@@ -32,3 +32,8 @@ error)`; use `Preamble.Get` so `/agents reload` works without rebuilding.
 - Tests (`harness_test.go`) drive the full loop against an `httptest` fake
   endpoint: text, tool call → execute → feed back, and the HITL confirmation
   two-`Run` round trip.
+- `Provider` (Phase 6) also exposes `LLMModel model.LLM` (the built model,
+  incl. the `opts.Model` test override — sideband calls like context
+  compression reuse it) and `SessionService session.Service` (compression
+  writes its summary + marker through it between turns). Both are set in
+  `Build` from `opts`.

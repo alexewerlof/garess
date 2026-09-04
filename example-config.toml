@@ -20,6 +20,10 @@ name = "llamacpp"
 endpoint = "http://127.0.0.1:8080/v1"   # local llama.cpp server
 api_key = ""                            # llama.cpp needs no key
 model = "qwen2.5-1.5b-instruct"
+# context_window = 32768               # model context size in tokens (used for the
+                                        # context usage indicator + auto-compress).
+                                        # When unset (0), garess probes /v1/models
+                                        # and falls back to 128k.
 
 [[providers]]
 name = "deepseek"
@@ -38,6 +42,9 @@ theme = "dark"                          # auto | dark | light
 
 [session]
 history_limit = 40                      # messages kept in the model context
+# auto_compress_threshold = 80          # context usage % that triggers automatic
+                                        # compression after a turn (0 = disable;
+                                        # manual /compress always available)
 
 # ---------------------------------------------------------------------------
 # Git-style hooks (Phase 3). Optional — omit the whole section for no hooks.

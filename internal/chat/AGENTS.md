@@ -18,3 +18,20 @@ Google ADK `session.Service` backed by JSONL transcripts in
   transcript stays on disk). The runner never passes `NumRecentEvents`, so
   trimming is entirely this service's job.
 - `NewSessionID()` / `NewEventID()` (crypto/rand) live in id.go.
+
+## Context compaction (Phase 6)
+
+- The model view can be compacted WITHOUT touching the transcript:
+  `Service.Compact` (between turns) appends a summary event (author `user`,
+  plain text) and records the latest `compaction{SummaryEventID,
+CoveredThroughEventID, CoveredCount, Timestamp}` in the meta sidecar.
+- `Get`/`List` then filter: model-visible = `[summary] + events after
+CoveredThroughEventID` (the summary event itself is excluded from the
+  tail), then `trim` keeps the summary sticky — the cap trims the tail, never
+  the summary head. Each new compaction covers a prefix that includes the
+  earlier summary, so only the latest marker is needed (older ones are
+  subsumed). If the marker references missing events, Get fails open to raw
+  history.
+- The JSONL transcript is never rewritten or deleted by compaction — it
+  stays the complete review record. `history_limit` still bounds event count
+  on top of compaction.

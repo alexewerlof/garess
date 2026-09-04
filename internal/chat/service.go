@@ -22,6 +22,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/genai"
+
+	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/session"
 )
 
@@ -56,9 +59,23 @@ func (s *Service) Dir() string { return s.dir }
 
 // meta is the per-session metadata sidecar.
 type meta struct {
-	AppName string         `json:"appName"`
-	UserID  string         `json:"userID"`
-	State   map[string]any `json:"state,omitempty"`
+	AppName    string         `json:"appName"`
+	UserID     string         `json:"userID"`
+	State      map[string]any `json:"state,omitempty"`
+	Compaction *compaction    `json:"compaction,omitempty"`
+}
+
+// compaction records one context-compression: in the model's view, every
+// event up to and including CoveredThroughEventID was replaced by the summary
+// event SummaryEventID. The raw transcript on disk is untouched. Only the
+// latest compaction is stored — each new compression covers a prefix of the
+// event log that includes any earlier summary, so the latest record subsumes
+// all previous ones.
+type compaction struct {
+	SummaryEventID        string    `json:"summaryEventId"`
+	CoveredThroughEventID string    `json:"coveredThroughEventId"`
+	CoveredCount          int       `json:"coveredCount"`
+	Timestamp             time.Time `json:"timestamp"`
 }
 
 // Create implements session.Service.
@@ -107,7 +124,8 @@ func (s *Service) Get(ctx context.Context, req *session.GetRequest) (*session.Ge
 	if err != nil {
 		return nil, err
 	}
-	events = s.trim(events, req)
+	events, sticky := applyCompaction(events, m.Compaction)
+	events = s.trim(events, req, sticky)
 	sess := s.newSession(req.AppName, req.UserID, req.SessionID, m.State)
 	sess.events = events
 	return &session.GetResponse{Session: sess}, nil
@@ -143,8 +161,9 @@ func (s *Service) List(ctx context.Context, req *session.ListRequest) (*session.
 		if err != nil {
 			continue
 		}
+		events, sticky := applyCompaction(events, m.Compaction)
 		sess := s.newSession(req.AppName, m.UserID, id, m.State)
-		sess.events = s.trim(events, nil)
+		sess.events = s.trim(events, nil, sticky)
 		out = append(out, sess)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -207,19 +226,7 @@ func (s *Service) AppendEvent(ctx context.Context, sess session.Session, ev *ses
 	if ev.Timestamp.IsZero() {
 		ev.Timestamp = time.Now()
 	}
-	line, err := json.Marshal(ev)
-	if err != nil {
-		return fmt.Errorf("chat: encode event: %w", err)
-	}
-	f, err := os.OpenFile(s.jsonlPath(sess.ID()), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(append(line, '\n')); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
+	if err := s.appendLine(sess.ID(), ev); err != nil {
 		return err
 	}
 	if impl, ok := sess.(*sessionImpl); ok {
@@ -230,6 +237,24 @@ func (s *Service) AppendEvent(ctx context.Context, sess session.Session, ev *ses
 		}
 	}
 	return nil
+}
+
+// appendLine marshals ev and appends it to the session's JSONL. ID and
+// Timestamp must already be set.
+func (s *Service) appendLine(id string, ev *session.Event) error {
+	line, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("chat: encode event: %w", err)
+	}
+	f, err := os.OpenFile(s.jsonlPath(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // routeState merges a state key into the app/user/session stores.
@@ -327,8 +352,11 @@ func (s *Service) readEvents(path string) ([]*session.Event, error) {
 }
 
 // trim applies the After/NumRecentEvents filters and the historyLimit cap.
+// protectFirst (set when the leading event is a compaction summary) keeps
+// that event even when the cap would otherwise drop it — the summary stands
+// for the whole earlier conversation, so it must not age out of the window.
 // A nil request applies only the historyLimit cap.
-func (s *Service) trim(events []*session.Event, req *session.GetRequest) []*session.Event {
+func (s *Service) trim(events []*session.Event, req *session.GetRequest, protectFirst bool) []*session.Event {
 	start := 0
 	if req != nil && !req.After.IsZero() {
 		for i, ev := range events {
@@ -339,16 +367,118 @@ func (s *Service) trim(events []*session.Event, req *session.GetRequest) []*sess
 		}
 	}
 	if start > 0 {
-		events = events[start:]
+		if protectFirst {
+			// Keep the summary even if the After filter precedes it.
+			events = append([]*session.Event{events[0]}, events[start:]...)
+		} else {
+			events = events[start:]
+		}
 	}
 	limit := s.historyLimit
 	if req != nil && req.NumRecentEvents > 0 {
 		limit = req.NumRecentEvents
 	}
 	if limit > 0 && len(events) > limit {
-		events = events[len(events)-limit:]
+		if protectFirst {
+			tail := events[1:]
+			if limit-1 < len(tail) {
+				tail = tail[len(tail)-(limit-1):]
+			}
+			events = append([]*session.Event{events[0]}, tail...)
+		} else {
+			events = events[len(events)-limit:]
+		}
 	}
 	return events
+}
+
+// applyCompaction replaces, in the model's view, every event up to and
+// including the compaction's CoveredThroughEventID with the summary event.
+// The raw transcript is untouched. The bool reports whether the compaction
+// applied (the returned list starts with the sticky summary event).
+func applyCompaction(events []*session.Event, comp *compaction) ([]*session.Event, bool) {
+	if comp == nil || comp.SummaryEventID == "" {
+		return events, false
+	}
+	var summary *session.Event
+	covered := -1
+	for i, ev := range events {
+		if ev.ID == comp.SummaryEventID {
+			summary = ev
+		}
+		if ev.ID == comp.CoveredThroughEventID {
+			covered = i
+		}
+	}
+	if summary == nil || covered < 0 {
+		// Marker references events no longer in the log (should not happen:
+		// the log is append-only) — fail open to the raw history.
+		return events, false
+	}
+	out := make([]*session.Event, 0, len(events)-covered)
+	out = append(out, summary)
+	for i := covered + 1; i < len(events); i++ {
+		if events[i].ID == comp.SummaryEventID {
+			continue // the summary event itself is only ever shown at the head
+		}
+		out = append(out, events[i])
+	}
+	return out, true
+}
+
+// CompactRequest describes a context-compression: events up to and including
+// CoveredThroughEventID are replaced, in the model's view, by one summary
+// event carrying SummaryText. The raw transcript is preserved.
+type CompactRequest struct {
+	AppName               string
+	UserID                string
+	SessionID             string
+	SummaryText           string
+	CoveredThroughEventID string
+	CoveredCount          int
+}
+
+// Compact appends a summary event authored by the user and records the
+// compaction marker in the session metadata. Subsequent Get calls return the
+// summary followed by the events after the covered prefix. It is meant to run
+// between turns, when no run holds the session open.
+func (s *Service) Compact(ctx context.Context, req *CompactRequest) (*session.Event, error) {
+	if !s.exists(req.SessionID) {
+		return nil, fmt.Errorf("chat: session %q not found", req.SessionID)
+	}
+	m, err := readMeta(s.metaPath(req.SessionID))
+	if err != nil {
+		return nil, fmt.Errorf("chat: session %q not found", req.SessionID)
+	}
+	if m.AppName != req.AppName || m.UserID != req.UserID {
+		return nil, fmt.Errorf("chat: session %q not found", req.SessionID)
+	}
+	ev := &session.Event{
+		Author: "user",
+		LLMResponse: model.LLMResponse{
+			Content: &genai.Content{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{
+					{Text: req.SummaryText},
+				},
+			},
+		},
+	}
+	ev.ID = NewEventID()
+	ev.Timestamp = time.Now()
+	if err := s.appendLine(req.SessionID, ev); err != nil {
+		return nil, err
+	}
+	m.Compaction = &compaction{
+		SummaryEventID:        ev.ID,
+		CoveredThroughEventID: req.CoveredThroughEventID,
+		CoveredCount:          req.CoveredCount,
+		Timestamp:             ev.Timestamp,
+	}
+	if err := writeMeta(s.metaPath(req.SessionID), m); err != nil {
+		return nil, err
+	}
+	return ev, nil
 }
 
 func writeMeta(path string, m *meta) error {

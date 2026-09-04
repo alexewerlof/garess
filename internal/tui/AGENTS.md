@@ -114,3 +114,44 @@ and inject keys via `prog.Send`; `prog.Run()` may return the final model as a
 value OR a pointer (type-switch both). Persistence happens in the runner
 before events reach the UI, so poll the session service then `drain()` before
 sending `Quit`.
+
+## Context usage + compression (Phase 6)
+
+- See `context.go`: `Options` (passed into `New` — no opts = auto-compress on
+  at 80%, fallback window 128k marked `≈`), `usage` estimate helpers, and the
+  async compression flow (`startCompression` / `runCompression` /
+  `handleCompressResult`, message `compressMsg`).
+- Model fields: `ctxEst`/`ctxLastPrompt`/`ctxUsageThisRun` — exact
+  `usage.prompt_tokens` is captured after every completed model event
+  (`trackUsage`; the wire asks for it via `stream_options.include_usage`);
+  when a run saw no usage, `finishStreaming` falls back to
+  `estimatedPromptTokens()` (events + preamble, marked ≈). Also
+  `ctxWindow`/`ctxApprox` (per-provider `windows` map),
+  `compressing`/`compressIsAuto`, `pendingSend`/`pendingText` (pre-send
+  auto-compress queue; restored to the textarea if cancelled),
+  `summaryEventID`, `ctxNoAutoAfter` (anti-thrash watermark).
+- The context readout is ALWAYS visible, right-aligned on the status line
+  (`statusLine` → `contextReadout`: `ctx ≈12% · 30k/262k used · 232k free`;
+  `≈` when the window is a fallback or the value is an unanchored estimate).
+  It is NOT in the header. resize / /new / provider switch keep it consistent
+  (`applyWindow`, resets in `newSession`).
+- Checkpoints are TURN BOUNDARIES ONLY: `finishStreaming` (after each
+  completed user↔assistant turn when the estimate is at/over the threshold)
+  and a `send()` backstop when the context is ALREADY at/over
+  `thresholdTokens()` (the new message itself is not compressible, so its
+  size does not drive the trigger). NO mid-loop compression — the whole tool
+  loop is one `runner.Run` and ADK v2.2.0 has no in-loop hook.
+- `/compress [instructions]` + `/compact` (manual; runs regardless of usage);
+  `/compress` requires ≥ 2 user messages (`compress.PickCutoff`) else
+  "nothing to compress". Keys are gated while `compressing` (esc cancels,
+  scroll/ctrl+t still work). While compressing, an in-conversation indicator
+  (`compressionIndicator` — the conversation-area live block above the
+  composer, the ONLY compression indicator; the status bar stays plain)
+  shows activity with wording by `compressIsAuto` (manual = "compressing
+  context", auto = "auto-compressing context"). The summary event renders as
+  a distinct block via `renderSummary` (match `ev.ID == m.summaryEventID`),
+  not a user bubble; the completion card reads `Context: X → Y tokens (freed
+  Z) · usage a% → b%
+of W` (`fmtCount` grouped numbers, `fmtPct` 1-decimal % under 10).
+- Value-copy rules apply to compression too: the goroutine only reads
+  snapshots captured at `startCompression` time (never the Model).

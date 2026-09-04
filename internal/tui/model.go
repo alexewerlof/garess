@@ -25,6 +25,8 @@ import (
 
 	"garess/internal/agents"
 	"garess/internal/chat"
+	"garess/internal/compress"
+	"garess/internal/config"
 	"garess/internal/harness"
 	"garess/internal/memory"
 	"garess/internal/skills"
@@ -88,6 +90,23 @@ type Model struct {
 	streamFailed      bool
 	stats             *tuiStats // GARESS_STATS=1 CPU-time breakdown (nil = disabled)
 
+	// Context usage tracking + compression (see context.go).
+	windows         map[string]windowInfo // resolved context window per provider
+	ctxWindow       int                   // active context window (tokens)
+	ctxApprox       bool                  // window came from the fallback default (≈)
+	ctxEst          int                   // estimated current usage
+	ctxLastPrompt   int                   // last exact server prompt_tokens
+	ctxUsageThisRun bool                  // a model event carried exact usage this run
+	ctxNoAutoAfter  int                   // events watermark before the next auto-compress
+	autoCompress    bool
+	autoCompressPct int
+	compressing     bool
+	compressIsAuto  bool // wording: "auto-compressing" vs "compressing"
+	compressCancel  context.CancelFunc
+	pendingSend     *genai.Content // user message queued behind a pre-send auto-compress
+	pendingText     string         // original text (restored if compression is cancelled)
+	summaryEventID  string         // latest compaction summary event (styled distinctly)
+
 	// HITL confirmation mode (ADK tool confirmation round trip).
 	confirming        bool
 	confirmPrompt     string
@@ -116,8 +135,25 @@ type (
 )
 
 // New builds the model. workDir is the working directory used to discover
-// AGENTS.md files. width/height may be 0 until the first resize event.
-func New(providers map[string]*harness.Provider, current, theme, userID, sessionID string, mem *memory.Store, preamble *harness.Preamble, workDir string, width, height int) (*Model, error) {
+// AGENTS.md files. width/height may be 0 until the first resize event. opts is
+// optional: with no Options the defaults apply (auto-compress on at 80%, no
+// configured context windows); pass Options to tune or disable compression.
+func New(providers map[string]*harness.Provider, current, theme, userID, sessionID string, mem *memory.Store, preamble *harness.Preamble, workDir string, width, height int, opts ...Options) (*Model, error) {
+	o := Options{}
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	autoCompress := true
+	if len(opts) > 0 {
+		autoCompress = o.AutoCompress
+	}
+	autoPct := o.AutoCompressPct
+	if autoPct <= 0 {
+		autoPct = config.DefaultAutoCompressThreshold
+	}
+	windows := resolveWindows(providers, o)
+	cur := windows[current]
+
 	md, err := newMarkdownRenderer(maxInt(width-4, 40), theme)
 	if err != nil {
 		return nil, err
@@ -147,6 +183,11 @@ func New(providers map[string]*harness.Provider, current, theme, userID, session
 		assistantThinking: newStreamChunkerWith(func(s string) string {
 			return ui.thinkingBody.Render(s)
 		}), // pointer: see streamBuffer
+		windows:         windows,
+		ctxWindow:       cur.size,
+		ctxApprox:       cur.approx,
+		autoCompress:    autoCompress,
+		autoCompressPct: autoPct,
 	}
 	if statsEnabled() {
 		m.stats = newTUIStats()
@@ -186,13 +227,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
-		if m.streaming {
+		if m.streaming || m.compressing {
+			if m.compressing {
+				// Animate the in-conversation compression indicator too.
+				m.updateViewport()
+			}
 			return m, tea.Tick(spinnerInterval, func(time.Time) tea.Msg { return spinnerTickMsg{} })
 		}
 		return m, nil
 
 	case adkEventMsg:
 		return m.handleADK(msg)
+
+	case compressMsg:
+		return m.handleCompressResult(msg)
 
 	case tea.KeyMsg:
 		if m.stats != nil {
@@ -266,6 +314,7 @@ func (m Model) handleADK(msg adkEventMsg) (tea.Model, tea.Cmd) {
 
 	m.events = append(m.events, ev)
 	m.rendered = append(m.rendered, m.renderEvent(ev))
+	m.trackUsage(ev)
 
 	if isConfirmationRequest(ev) {
 		m.enterConfirmation(ev)
@@ -308,6 +357,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			m.cancelStream()
+		case "up", "down", "pgup", "pgdown", "home", "end":
+			m.scroll(msg.String())
+			return m, nil
+		case "ctrl+t":
+			return m.toggleThinking()
+		}
+		return m, nil
+	}
+
+	// While an auto/manual compression is running, input is gated (esc can
+	// cancel it, scroll keys keep working).
+	if m.compressing {
+		switch msg.String() {
+		case "esc", "ctrl+c":
+			m.cancelCompression()
 		case "up", "down", "pgup", "pgdown", "home", "end":
 			m.scroll(msg.String())
 			return m, nil
@@ -361,7 +425,16 @@ func (m Model) send() (tea.Model, tea.Cmd) {
 	if strings.HasPrefix(text, "/") {
 		return m.handleCommand(text)
 	}
-	return m.startStream(genai.NewContentFromText(text, genai.RoleUser))
+	content := genai.NewContentFromText(text, genai.RoleUser)
+	// Auto-compress behind the scenes when the context is already at/over the
+	// threshold as the user sends — a backstop, since the post-turn check
+	// normally keeps it below. The prompt is queued and sent once compression
+	// finishes. The pending message itself is not compressible, so its size
+	// does not drive the trigger.
+	if m.autoCompress && m.ctxEst >= m.thresholdTokens() {
+		return m.startCompression(true, "", content, text)
+	}
+	return m.startStream(content)
 }
 
 // startStream kicks off a runner turn. content is either a user message or
@@ -379,6 +452,7 @@ func (m Model) startStream(content *genai.Content) (tea.Model, tea.Cmd) {
 	m.streaming = true
 	m.cancelled = false
 	m.streamFailed = false
+	m.ctxUsageThisRun = false
 	m.assistantActive = false
 	m.assistantChunks.reset()
 	m.assistantThinking.reset()
@@ -541,6 +615,20 @@ func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 		m.assistantChunks.render(m.md)
 	}
 	m.updateViewport()
+	// Servers that cannot report usage (no stream_options.include_usage
+	// support): fall back to a local estimate so the readout still reflects
+	// conversation growth after every turn.
+	if !m.cancelled && !m.streamFailed && !m.ctxUsageThisRun {
+		m.ctxEst = m.estimatedPromptTokens()
+		m.ctxLastPrompt = 0
+	}
+	// Auto-compress check after EVERY completed turn: a turn's tool outputs
+	// can be massive, so re-evaluate here (right after the run persisted
+	// them), not only when the user types the next prompt.
+	if m.autoCompress && !m.cancelled && !m.streamFailed &&
+		m.ctxEst >= m.thresholdTokens() && len(m.events) >= m.ctxNoAutoAfter {
+		return m.startCompression(true, "", nil, "")
+	}
 	return m, nil
 }
 
@@ -633,6 +721,12 @@ func (m Model) handleCommand(line string) (tea.Model, tea.Cmd) {
 		return m.handleSkills(fields[1:])
 	case "/tools":
 		return m.handleTools(fields[1:])
+	case "/compress", "/compact":
+		if m.streaming || m.confirming {
+			m.err = "wait for the current response before compressing context"
+			return m, nil
+		}
+		return m.startCompression(false, strings.Join(fields[1:], " "), nil, "")
 	default:
 		m.err = fmt.Sprintf("unknown command %q — type /help", cmd)
 	}
@@ -661,13 +755,13 @@ func (m Model) handleTools(args []string) (tea.Model, tea.Cmd) {
 		sb.WriteString("No regex rules are configured. Tools are allowed by default.\n\n")
 	} else {
 		if len(policy.Deny) > 0 {
-			sb.WriteString("- deny: " + strings.Join(policy.Deny, ", ") + "\n")
+			fmt.Fprintf(&sb, "- deny: %s\n", strings.Join(policy.Deny, ", "))
 		}
 		if len(policy.Ask) > 0 {
-			sb.WriteString("- ask: " + strings.Join(policy.Ask, ", ") + "\n")
+			fmt.Fprintf(&sb, "- ask: %s\n", strings.Join(policy.Ask, ", "))
 		}
 		if len(policy.Allow) > 0 {
-			sb.WriteString("- allow: " + strings.Join(policy.Allow, ", ") + "\n")
+			fmt.Fprintf(&sb, "- allow: %s\n", strings.Join(policy.Allow, ", "))
 		}
 	}
 	sb.WriteString("\n**Built-ins**\n\n")
@@ -813,6 +907,12 @@ func (m Model) newSession() (tea.Model, tea.Cmd) {
 	m.assistantThinking.reset()
 	m.thinkingBlock = ""
 	m.thinkingFrozen = false
+	m.summaryEventID = ""
+	m.ctxEst = 0
+	m.ctxLastPrompt = 0
+	m.ctxNoAutoAfter = 0
+	m.ctxUsageThisRun = false
+	m.compressIsAuto = false
 	m.resetView()
 	m.status = "new session started"
 	m.updateViewport()
@@ -835,11 +935,13 @@ func (m Model) switchProvider(arg string) (tea.Model, tea.Cmd) {
 		// so overrides apply to this session only by swapping the current.
 		m.providers[name] = prov
 		m.current = name
+		m.applyWindow(name)
 		m.status = fmt.Sprintf("switched to %s · %s", name, prov.Model)
 		m.addInfo(fmt.Sprintf("Now using provider **%s**, model **%s**.", name, prov.Model))
 		return m, nil
 	}
 	m.current = name
+	m.applyWindow(name)
 	m.status = fmt.Sprintf("switched to %s · %s", name, prov.Model)
 	m.addInfo(fmt.Sprintf("Now using provider **%s**, model **%s**.", name, prov.Model))
 	return m, nil
@@ -1091,6 +1193,9 @@ func (m *Model) renderEvent(ev *session.Event) string {
 	if ev.Content == nil {
 		return ""
 	}
+	if ev.ID != "" && ev.ID == m.summaryEventID {
+		return m.renderSummary(ev)
+	}
 	switch {
 	case hasFunctionResponse(ev.Content):
 		return m.renderFunctionResponse(ev.Content)
@@ -1101,6 +1206,17 @@ func (m *Model) renderEvent(ev *session.Event) string {
 	default:
 		return m.renderAssistant(textOf(ev.Content), thoughtOf(ev.Content))
 	}
+}
+
+// renderSummary renders the compaction summary event — the head of the
+// compacted conversation — as a distinct block rather than a user message.
+func (m *Model) renderSummary(ev *session.Event) string {
+	body := strings.TrimSpace(strings.TrimPrefix(textOf(ev.Content), compress.SummaryHeader))
+	md, err := m.md.Render(body)
+	if err != nil {
+		md = body
+	}
+	return ui.summaryHeader.Render("● Earlier conversation compressed") + "\n\n" + md
 }
 
 func hasFunctionCall(c *genai.Content) bool {
@@ -1351,7 +1467,9 @@ func (m *Model) updateViewport() {
 		m.conv.appendStable(stable[i]) // O(delta): only new parts are appended
 	}
 	m.viewCommitted = len(stable)
-	if m.assistantActive {
+	if m.compressing {
+		m.conv.setLive(m.compressionIndicator())
+	} else if m.assistantActive {
 		m.conv.setLive(m.streamTail())
 	} else {
 		m.conv.clearLive()
@@ -1461,7 +1579,20 @@ func (m Model) statusLine() string {
 		parts = append(parts, ui.status.Render(m.status))
 	}
 	parts = append(parts, ui.status.Render("enter send · ctrl+j newline · /help · ctrl+c quit"))
-	return lipgloss.JoinHorizontal(lipgloss.Left, parts...)
+	line := lipgloss.JoinHorizontal(lipgloss.Left, parts...)
+	// Context usage is always visible, right-aligned on the status line.
+	if r := m.contextReadout(); r != "" {
+		seg := ui.info.Render(r)
+		if m.width > 0 {
+			if pad := m.width - lipgloss.Width(line) - lipgloss.Width(seg) - 1; pad > 0 {
+				line += strings.Repeat(" ", pad)
+			}
+		} else {
+			line += "  "
+		}
+		line += seg
+	}
+	return line
 }
 
 // --- helpers -------------------------------------------------------------
@@ -1510,7 +1641,9 @@ const helpText = "**garess commands**\n\n" +
 	"- `/agents reload` — re-read AGENTS.md / SYSTEM.md from disk\n" +
 	"- `/skills` — show installed skills in effect\n" +
 	"- `/skills reload` — re-read skills from disk\n" +
-	"- `/tools` — show the built-in tool policy and available tools\n\n" +
+	"- `/tools` — show the built-in tool policy and available tools\n" +
+	"- `/compress [instructions]` — compress the conversation into a summary\n" +
+	"  (`/compact` works too; optional instructions steer the summary)\n\n" +
 	"**Keys**\n\n" +
 	"- `enter` — send\n" +
 	"- `ctrl+j` — insert newline\n" +

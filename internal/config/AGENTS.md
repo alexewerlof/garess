@@ -34,3 +34,15 @@ Headers}` stored as-is on `Config.MCPServers`. `Validate` checks unique
 - When adding a field, keep `merge`, `applyDefaults`, `Validate`, and the
   tests in sync, and mirror the change in `example-config.toml` and
   `docs/configuration.md`.
+
+## Context settings (Phase 6)
+
+- `providers[].context_window` (int, tokens; 0 = unknown → probe `/v1/models`
+  then `DefaultContextWindow` 128k). Provider merge replaces the whole
+  provider block by name (as before).
+- `session.auto_compress_threshold` is an **`*int`** so an explicit `0` can
+  disable auto-compress while absence means the default (80). Merge copies
+  the pointer when non-nil; `applyDefaults` materializes it when nil;
+  `AutoCompressEnabled()` / `AutoCompressThresholdPct()` are the read
+  helpers. `Validate` bounds it to 0..100 and rejects negative
+  `context_window`.

@@ -321,10 +321,7 @@ write_dirs = ["/home/u/.cache", "/var/tmp"]
 	}
 
 	// Defaults apply when the section is absent.
-	cfg2, err := Default(), error(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg2 := Default()
 	if cfg2.Sandbox.Backend != "none" {
 		t.Fatalf("default backend = %q, want none", cfg2.Sandbox.Backend)
 	}
@@ -634,5 +631,138 @@ func TestValidateMCPServersDuplicateNames(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "duplicate mcp_server name") {
 		t.Fatalf("err = %v, want duplicate mcp_server name", err)
+	}
+}
+
+func TestContextWindowAndAutoCompressDecode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	write(t, p, `
+[[providers]]
+name = "local"
+endpoint = "http://127.0.0.1:8080/v1"
+model = "m"
+context_window = 65536
+
+[session]
+auto_compress_threshold = 60
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov, ok := cfg.Provider("local")
+	if !ok {
+		t.Fatal("provider missing")
+	}
+	if prov.ContextWindow != 65536 {
+		t.Fatalf("context_window = %d, want 65536", prov.ContextWindow)
+	}
+	if cfg.Session.AutoCompressThresholdPct() != 60 {
+		t.Fatalf("threshold pct = %d, want 60", cfg.Session.AutoCompressThresholdPct())
+	}
+	if !cfg.Session.AutoCompressEnabled() {
+		t.Fatal("expected auto-compress enabled at 60")
+	}
+}
+
+func TestAutoCompressDefaults(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	write(t, p, `
+[[providers]]
+name = "local"
+endpoint = "http://127.0.0.1:8080/v1"
+model = "m"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Session.AutoCompressThresholdPct(); got != DefaultAutoCompressThreshold {
+		t.Fatalf("threshold pct = %d, want default %d", got, DefaultAutoCompressThreshold)
+	}
+	if !cfg.Session.AutoCompressEnabled() {
+		t.Fatal("auto-compress should default to enabled")
+	}
+	if cfg.Session.AutoCompressThreshold == nil {
+		t.Fatal("applyDefaults should materialize the threshold pointer")
+	}
+}
+
+func TestAutoCompressDisabledWithZero(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	write(t, p, `
+[[providers]]
+name = "local"
+endpoint = "http://127.0.0.1:8080/v1"
+model = "m"
+
+[session]
+auto_compress_threshold = 0
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Session.AutoCompressEnabled() {
+		t.Fatal("auto-compress should be disabled when threshold is 0")
+	}
+}
+
+func TestAutoCompressThresholdMergeProjectOverrides(t *testing.T) {
+	dir := t.TempDir()
+	global := filepath.Join(dir, "global.toml")
+	project := filepath.Join(dir, "project.toml")
+
+	write(t, global, `
+[[providers]]
+name = "a"
+endpoint = "https://a.example/v1"
+model = "ma"
+[session]
+auto_compress_threshold = 80
+`)
+	// A project setting 0 (disable) must override the global 80.
+	write(t, project, `
+[[providers]]
+name = "a"
+endpoint = "https://a.example/v1"
+model = "ma"
+[session]
+auto_compress_threshold = 0
+`)
+	cfg, _, err := loadFrom(global, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Session.AutoCompressEnabled() {
+		t.Fatal("project threshold 0 should disable auto-compress over the global 80")
+	}
+}
+
+func TestValidateContextWindowNegative(t *testing.T) {
+	cfg := Default()
+	cfg.Providers = []Provider{{Name: "x", Endpoint: "https://x.example/v1", Model: "m", ContextWindow: -1}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "context_window") {
+		t.Fatalf("err = %v, want context_window error", err)
+	}
+}
+
+func TestValidateAutoCompressThresholdOutOfRange(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	write(t, p, `
+[[providers]]
+name = "x"
+endpoint = "https://x.example/v1"
+model = "m"
+[session]
+auto_compress_threshold = 150
+`)
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "auto_compress_threshold") {
+		t.Fatalf("err = %v, want auto_compress_threshold error", err)
 	}
 }

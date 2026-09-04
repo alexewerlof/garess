@@ -41,11 +41,19 @@ name = "llamacpp"                          # unique name; used by /model and --p
 endpoint = "http://127.0.0.1:8080/v1"      # must include the /v1 prefix
 api_key = ""                               # or GA_RESS_API_KEY
 model = "qwen2.5-1.5b-instruct"            # model served by that endpoint
+context_window = 32768                      # optional: model context size in tokens
 ```
 
 Multiple `[[providers]]` blocks are allowed. At launch, `--provider <name>`
 selects one and `--model <name>` overrides its model; at runtime `/model`
 does the same.
+
+`context_window` sets the model's context size in tokens — the reference for
+the `ctx` usage indicator in the header and for the auto-compress threshold.
+When it is unset (0), garess probes `GET /v1/models` at launch (best effort)
+and falls back to 128k if the endpoint does not advertise a context length.
+Endpoints rarely advertise it, so setting `context_window` is recommended
+for an accurate indicator.
 
 ## `[tui]`
 
@@ -58,11 +66,43 @@ theme = "dark"   # auto | dark | light
 
 ```toml
 [session]
-history_limit = 40   # conversation messages kept in the model context
+history_limit = 40              # conversation messages kept in the model context
+auto_compress_threshold = 80   # context usage % that triggers auto-compression (0 = off)
 ```
 
 Older events stay in the transcript on disk; only the most recent
 `history_limit` messages are sent to the model.
+
+## Context compression
+
+The status bar always shows a live `ctx` readout — the percentage of the
+context window in use, the used/total sizes and the free space (e.g.
+`ctx ≈12% · 30k/262k used · 232k free`). The numbers are exact after every
+reply because garess asks the server for token usage on each streamed response
+(`stream_options.include_usage`); servers that cannot report it fall back to
+a local estimate (~1 token per 4 characters over the conversation +
+instructions), marked with `≈`. `≈` on the percentage also means the window is
+a fallback guess rather than configured.
+
+When the estimated usage reaches `auto_compress_threshold` percent of the
+window, garess compresses the conversation **after a completed turn** (tool
+outputs can be large, so the check runs right after every turn) and — as a
+backstop — **before a prompt sent while the context is already at/over the
+threshold**. Manual compression is always available with `/compress
+[instructions]` (alias `/compact`), where the optional instructions steer
+what the summary should preserve.
+
+Compression summarizes every older exchange up to the most recent user
+message into one compact digest and keeps the latest exchange verbatim, so
+the model sees `[summary … recent turn]` instead of the full history. The raw
+JSONL transcript is never modified: the full conversation stays on disk and
+only the model's view is compacted (a marker in the session metadata drives
+the read-time filter). While it runs, an in-conversation indicator (in the
+history area, above the input box) shows `compressing context…` (manual) or
+`auto-compressing context…` (auto); the summary card reports what was freed
+(`Context: 1,024 → 337 tokens (freed 687) · usage 0.4% → 0.1% of 262k`). Set
+`auto_compress_threshold = 0` to disable automatic compression (manual
+`/compress` stays available).
 
 ## MCP servers
 

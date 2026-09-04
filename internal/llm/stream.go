@@ -9,13 +9,22 @@ import (
 // unknown fields are ignored by encoding/json.
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Tools       []chatTool    `json:"tools,omitempty"`
-	Stream      bool          `json:"stream"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Stop        []string      `json:"stop,omitempty"`
+	Model         string             `json:"model"`
+	Messages      []chatMessage      `json:"messages"`
+	Tools         []chatTool         `json:"tools,omitempty"`
+	Stream        bool               `json:"stream"`
+	StreamOptions *chatStreamOptions `json:"stream_options,omitempty"`
+	Temperature   *float64           `json:"temperature,omitempty"`
+	MaxTokens     int                `json:"max_tokens,omitempty"`
+	Stop          []string           `json:"stop,omitempty"`
+}
+
+// chatStreamOptions implements OpenAI's stream_options.include_usage: many
+// OpenAI-compatible servers (llama.cpp among them) only report `usage` in a
+// streamed response when explicitly asked, and garess needs prompt_tokens for
+// its context readout.
+type chatStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessage struct {

@@ -8,7 +8,7 @@ format is hand-rolled so `reasoning_content` stays under our control.
   the `model.LLM`; the endpoint must include `/v1`.
 - `GenerateContent` implements the two-method ADK interface (`Name` +
   `GenerateContent(ctx, *model.LLMRequest, stream bool) iter.Seq2[*LLMResponse,
-  error]`). Content is genai-typed end-to-end.
+error]`). Content is genai-typed end-to-end.
 - **The ADK flow sets `req.Model` from `Name()`, so the wire request ALWAYS
   uses the configured `modelName`** — never `req.Model`.
 - The system instruction arrives in `req.Config.SystemInstruction` (a genai
@@ -22,5 +22,16 @@ format is hand-rolled so `reasoning_content` stays under our control.
   tool calls + usage. Tool-call arguments are buffered and parsed only at the
   end.
 - `Ping`/`ListModels` (in doctor.go) hit `GET /v1/models` for `garess doctor`.
+- `LookupContextWindow` (doctor.go, Phase 6) parses a model's advertised
+  context length from `/v1/models` — tolerant across keys
+  (`context_length`, `context_window`, `max_model_len`, …) at top level or
+  under `meta`, and string-or-number values. Exact model match wins, then the
+  first entry that reports one. Best effort: callers (cmd/garess
+  `resolveContextWindows`) fall back to a configured `context_window` or
+  `config.DefaultContextWindow`.
+- Streaming requests ask for the usage chunk via OpenAI
+  `stream_options.include_usage` (llama.cpp et al. only report `usage` in a
+  stream when asked); the final chunk's `usage` is mapped to
+  `UsageMetadata` so garess has the exact `prompt_tokens` per model call.
 - Tests use an `httptest` fake OpenAI endpoint (`model_test.go`) — never hit
   real networks in tests.

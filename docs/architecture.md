@@ -54,20 +54,21 @@ The TUI never writes to the session service directly. It pumps ADK
 
 ## Package map
 
-| Package            | Responsibility                                      | Depends on                                   |
-| ------------------ | --------------------------------------------------- | -------------------------------------------- |
-| `cmd/garess`       | CLI, flags, `doctor`, startup wiring                | everything                                   |
-| `internal/config`  | TOML config, XDG paths, merge, typed errors         | —                                            |
-| `internal/agents`  | AGENTS.md/SYSTEM.md discovery + rendering           | —                                            |
-| `internal/skills`  | skill discovery + rendering                         | `internal/agents`                            |
-| `internal/memory`  | markdown memory notes (local + global)              | —                                            |
-| `internal/llm`     | custom ADK `model.LLM` over OpenAI chat-completions | —                                            |
-| `internal/chat`    | ADK `session.Service` over JSONL transcripts        | —                                            |
-| `internal/tools`   | built-in functiontools + allow/ask/deny policy      | `internal/memory`                            |
-| `internal/hooks`   | git-style shell hooks as an ADK plugin              | `internal/config`                            |
-| `internal/sandbox` | Landlock write sandbox (`none`/`auto`/`landlock`)   | `internal/config`                            |
-| `internal/harness` | wires one provider into ADK agent + runner          | config, hooks, llm, memory, tools            |
-| `internal/tui`     | Bubble Tea UI; pumps runner events                  | agents, chat, harness, memory, skills, tools |
+| Package             | Responsibility                                      | Depends on                                             |
+| ------------------- | --------------------------------------------------- | ------------------------------------------------------ |
+| `cmd/garess`        | CLI, flags, `doctor`, startup wiring                | everything                                             |
+| `internal/config`   | TOML config, XDG paths, merge, typed errors         | —                                                      |
+| `internal/agents`   | AGENTS.md/SYSTEM.md discovery + rendering           | —                                                      |
+| `internal/skills`   | skill discovery + rendering                         | `internal/agents`                                      |
+| `internal/memory`   | markdown memory notes (local + global)              | —                                                      |
+| `internal/llm`      | custom ADK `model.LLM` over OpenAI chat-completions | —                                                      |
+| `internal/chat`     | ADK `session.Service` over JSONL transcripts        | —                                                      |
+| `internal/compress` | context-compression engine (estimator, prompts)     | — (calls a `model.LLM`)                                |
+| `internal/tools`    | built-in functiontools + allow/ask/deny policy      | `internal/memory`                                      |
+| `internal/hooks`    | git-style shell hooks as an ADK plugin              | `internal/config`                                      |
+| `internal/sandbox`  | Landlock write sandbox (`none`/`auto`/`landlock`)   | `internal/config`                                      |
+| `internal/harness`  | wires one provider into ADK agent + runner          | config, hooks, llm, memory, tools                      |
+| `internal/tui`      | Bubble Tea UI; pumps runner events                  | agents, chat, compress, harness, memory, skills, tools |
 
 ## Key design decisions
 

@@ -35,6 +35,14 @@ type Provider struct {
 	Model  string
 	Agent  agent.Agent
 	Runner *runner.Runner
+	// LLMModel is the concrete model instance driving the runner (the model
+	// built from the provider config, or opts.Model in tests). Sideband model
+	// calls such as context compression reuse it.
+	LLMModel model.LLM
+	// SessionService is the shared session service the runner persists to;
+	// context compression writes its summary event + marker through it
+	// between turns.
+	SessionService session.Service
 }
 
 // Options configures harness.Build.
@@ -146,7 +154,7 @@ func Build(pc config.Provider, opts Options) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("harness: build runner: %w", err)
 	}
-	return &Provider{Name: pc.Name, Model: pc.Model, Agent: ag, Runner: r}, nil
+	return &Provider{Name: pc.Name, Model: pc.Model, Agent: ag, Runner: r, LLMModel: m, SessionService: opts.SessionService}, nil
 }
 
 // iterationCapCallback caps the number of model calls per run (one invocation)

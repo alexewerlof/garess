@@ -238,6 +238,11 @@ func (m *ChatCompletionsModel) buildChatRequest(req *model.LLMRequest, stream bo
 		Messages: m.toChatMessages(req),
 		Stream:   stream,
 	}
+	if stream {
+		// Ask for the usage chunk so the exact prompt token count is known
+		// after every model call (llama.cpp etc. only send usage on request).
+		cr.StreamOptions = &chatStreamOptions{IncludeUsage: true}
+	}
 	if tools := toChatTools(req); len(tools) > 0 {
 		cr.Tools = tools
 	}

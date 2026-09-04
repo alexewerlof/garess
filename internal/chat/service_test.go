@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -147,4 +148,180 @@ func TestServiceConformance(t *testing.T) {
 	}, func(t *testing.T) session.Service {
 		return NewService(t.TempDir(), 1000)
 	})
+}
+
+// appendN appends n plain user-text events and returns their assigned IDs.
+func appendN(t *testing.T, svc *Service, sess session.Session, n int) []string {
+	t.Helper()
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ev := &session.Event{
+			Author:      "user",
+			LLMResponse: model.LLMResponse{Content: genai.NewContentFromText(fmt.Sprintf("m%d", i), genai.RoleUser)},
+		}
+		if err := svc.AppendEvent(context.Background(), sess, ev); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, ev.ID)
+	}
+	return ids
+}
+
+func textOf(t *testing.T, ev *session.Event) string {
+	t.Helper()
+	if ev == nil || ev.Content == nil || len(ev.Content.Parts) == 0 {
+		return ""
+	}
+	return ev.Content.Parts[0].Text
+}
+
+func TestServiceCompactView(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(dir, 100)
+	created, err := svc.Create(context.Background(), &session.CreateRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := appendN(t, svc, created.Session, 5)
+
+	sumEv, err := svc.Compact(context.Background(), &CompactRequest{
+		AppName: "a", UserID: "u", SessionID: "s",
+		SummaryText: "SUMMARY", CoveredThroughEventID: ids[2], CoveredCount: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.Get(context.Background(), &session.GetRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := collectEvents(got.Session)
+	if len(out) != 3 {
+		t.Fatalf("view events = %d, want 3", len(out))
+	}
+	if out[0].ID != sumEv.ID || textOf(t, out[0]) != "SUMMARY" {
+		t.Errorf("view[0] = %+v, want the summary event", out[0])
+	}
+	if textOf(t, out[1]) != "m3" || textOf(t, out[2]) != "m4" {
+		t.Errorf("view tail wrong: %q, %q", textOf(t, out[1]), textOf(t, out[2]))
+	}
+
+	// The raw transcript keeps everything: 5 original events + the summary.
+	all, err := svc.readEvents(svc.jsonlPath("s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 6 {
+		t.Fatalf("transcript events = %d, want 6 (full history preserved)", len(all))
+	}
+}
+
+func TestServiceCompactStickyUnderHistoryLimit(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(dir, 3)
+	created, err := svc.Create(context.Background(), &session.CreateRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := appendN(t, svc, created.Session, 2)
+	if _, err := svc.Compact(context.Background(), &CompactRequest{
+		AppName: "a", UserID: "u", SessionID: "s",
+		SummaryText: "SUMMARY", CoveredThroughEventID: first[1], CoveredCount: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Three more messages after compaction push the visible tail past the cap.
+	tail := appendN(t, svc, created.Session, 3)
+
+	got, err := svc.Get(context.Background(), &session.GetRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := collectEvents(got.Session)
+	if len(out) != 3 {
+		t.Fatalf("view events = %d, want 3 (summary + cap-1 tail)", len(out))
+	}
+	if textOf(t, out[0]) != "SUMMARY" {
+		t.Errorf("summary should be sticky at the head, got %q", textOf(t, out[0]))
+	}
+	// The cap keeps the summary plus the last (limit-1) tail events.
+	if out[1].ID != tail[1] || out[2].ID != tail[2] {
+		t.Errorf("tail wrong after sticky cap: %s, %s (want %s, %s)",
+			out[1].ID, out[2].ID, tail[1], tail[2])
+	}
+}
+
+func TestServiceCompactSecondCompactionSubsumesFirst(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(dir, 100)
+	created, err := svc.Create(context.Background(), &session.CreateRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := appendN(t, svc, created.Session, 5)
+	if _, err := svc.Compact(context.Background(), &CompactRequest{
+		AppName: "a", UserID: "u", SessionID: "s",
+		SummaryText: "SUM1", CoveredThroughEventID: first[1], CoveredCount: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// New turns land after the summary; the second compression summarizes a
+	// prefix that includes SUM1 and the first of the new turns (a realistic
+	// cutoff lies AFTER the previous summary in the raw log).
+	tail := appendN(t, svc, created.Session, 3)
+	if _, err := svc.Compact(context.Background(), &CompactRequest{
+		AppName: "a", UserID: "u", SessionID: "s",
+		SummaryText: "SUM2", CoveredThroughEventID: tail[0], CoveredCount: 8,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.Get(context.Background(), &session.GetRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := collectEvents(got.Session)
+	if len(out) != 3 {
+		t.Fatalf("view events = %d, want 3 ([SUM2, t1, t2])", len(out))
+	}
+	if textOf(t, out[0]) != "SUM2" || out[1].ID != tail[1] || out[2].ID != tail[2] {
+		t.Errorf("second compaction should subsume the first: got %q + %s, %s",
+			textOf(t, out[0]), out[1].ID, out[2].ID)
+	}
+	for _, ev := range out {
+		if textOf(t, ev) == "SUM1" {
+			t.Error("SUM1 leaked into the view after the second compaction")
+		}
+	}
+	// Transcript: 5 + SUM1 + 3 + SUM2 = 10 events, all preserved.
+	all, err := svc.readEvents(svc.jsonlPath("s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 10 {
+		t.Fatalf("transcript events = %d, want 10", len(all))
+	}
+}
+
+func TestServiceCompactOwnership(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(dir, 100)
+	created, err := svc.Create(context.Background(), &session.CreateRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := appendN(t, svc, created.Session, 2)
+	if _, err := svc.Compact(context.Background(), &CompactRequest{
+		AppName: "a", UserID: "someone-else", SessionID: "s",
+		SummaryText: "SUM", CoveredThroughEventID: ids[1],
+	}); err == nil {
+		t.Fatal("expected ownership error for another user's session")
+	}
+	if _, err := svc.Compact(context.Background(), &CompactRequest{
+		AppName: "a", UserID: "u", SessionID: "missing",
+		SummaryText: "SUM", CoveredThroughEventID: ids[1],
+	}); err == nil {
+		t.Fatal("expected error for a missing session")
+	}
 }

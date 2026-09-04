@@ -2,6 +2,8 @@ package tools
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,6 +101,70 @@ func TestDenyCallback(t *testing.T) {
 	}
 	if _, err := cb(ctxp, fakeTool{name: "bash"}, map[string]any{"command": "ls"}); err != nil {
 		t.Errorf("allowed call should pass: %v", err)
+	}
+}
+
+func TestCapOutput(t *testing.T) {
+	if got := capOutput("small"); got != "small" {
+		t.Errorf("small output should pass through, got %q", got)
+	}
+	big := strings.Repeat("x", MaxToolOutputChars+500)
+	got := capOutput(big)
+	if len(got) >= len(big) {
+		t.Fatal("oversized output should be truncated")
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Error("truncation marker missing")
+	}
+	// Exactly at the cap: untouched.
+	at := strings.Repeat("x", MaxToolOutputChars)
+	if capOutput(at) != at {
+		t.Error("output at the cap should not be truncated")
+	}
+}
+
+func TestReadFileCapsLargeContent(t *testing.T) {
+	ctx := agent.NewStrictContextMock(context.Background())
+	b := &builder{mem: nil, workDir: t.TempDir(), policy: Policy{}}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big.txt")
+	content := strings.Repeat("line\n", MaxToolOutputChars/4)
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.readFile(&ctx, ReadFileInput{Path: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, ok := res["output"].(string)
+	if !ok {
+		t.Fatalf("result = %#v", res)
+	}
+	if len(out) >= len(content) {
+		t.Fatal("read_file should cap oversized file content")
+	}
+	if !strings.Contains(out, "truncated") {
+		t.Error("truncation marker missing from read_file output")
+	}
+}
+
+func TestBashCapsLargeOutput(t *testing.T) {
+	ctx := agent.NewStrictContextMock(context.Background())
+	b := &builder{mem: nil, workDir: t.TempDir(), policy: Policy{}}
+	// 100k chars of output — comfortably over the cap.
+	res, err := b.bash(&ctx, BashInput{Command: "head -c 100000 /dev/zero | tr '\\0' 'x'"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, ok := res["output"].(string)
+	if !ok {
+		t.Fatalf("result = %#v", res)
+	}
+	if len(out) > MaxToolOutputChars+200 {
+		t.Fatalf("bash output not capped: %d chars", len(out))
+	}
+	if !strings.Contains(out, "truncated") {
+		t.Error("truncation marker missing from bash output")
 	}
 }
 

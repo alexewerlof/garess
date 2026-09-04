@@ -29,3 +29,8 @@ CLI entry point, flag parsing and subcommands.
   AGENTS.md / SYSTEM.md files.
 - Structured logs go to a file (`~/.config/garess/garess.log`) via `slog` so
   the TUI owns stdout. Put new diagnostics in `doctor`, not on stdout.
+- Context window resolution (Phase 6): `resolveContextWindows(cfg)` maps each
+  provider to its window — configured `context_window` wins, else a bounded
+  parallel `/v1/models` probe (`llm.LookupContextWindow`, 1.5s) — and feeds
+  `tui.Options`. `runDoctor` calls `reportContext` to print auto-compress
+  settings + each provider's resolved window/source.

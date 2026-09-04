@@ -16,6 +16,14 @@ const (
 	DefaultHistoryLimit = 40
 	// DefaultTheme is used when the theme is unset or "auto".
 	DefaultTheme = "dark"
+	// DefaultAutoCompressThreshold is the context usage percentage at which
+	// garess auto-compresses the conversation after a turn (0 disables).
+	DefaultAutoCompressThreshold = 80
+	// DefaultContextWindow is the assumed model context size (tokens) when a
+	// provider does not configure context_window and the /models endpoint does
+	// not advertise one. Used for the usage indicator and auto-compress
+	// decisions; configure context_window for accuracy.
+	DefaultContextWindow = 128_000
 )
 
 // ErrNotFound is returned when a config file does not exist.
@@ -154,6 +162,11 @@ type Provider struct {
 	Endpoint string `toml:"endpoint"`
 	APIKey   string `toml:"api_key"`
 	Model    string `toml:"model"`
+	// ContextWindow is the model context size in tokens. 0 means "unknown":
+	// garess then probes GET /v1/models and falls back to
+	// DefaultContextWindow. Used for the context usage indicator and the
+	// auto-compress threshold.
+	ContextWindow int `toml:"context_window"`
 }
 
 // TUI holds terminal UI options.
@@ -164,6 +177,29 @@ type TUI struct {
 // Session holds conversation options.
 type Session struct {
 	HistoryLimit int `toml:"history_limit"`
+	// AutoCompressThreshold is the context usage percentage (of the resolved
+	// context window) at which the conversation is auto-compressed after a
+	// turn and before a new prompt is sent. nil means the default
+	// (DefaultAutoCompressThreshold); a pointer to 0 disables auto-compression
+	// (manual /compress stays available).
+	AutoCompressThreshold *int `toml:"auto_compress_threshold"`
+}
+
+// AutoCompressThresholdPct returns the effective auto-compress threshold
+// percentage, applying DefaultAutoCompressThreshold when unset.
+func (s Session) AutoCompressThresholdPct() int {
+	if s.AutoCompressThreshold == nil || *s.AutoCompressThreshold == 0 {
+		return DefaultAutoCompressThreshold
+	}
+	return *s.AutoCompressThreshold
+}
+
+// AutoCompressEnabled reports whether auto-compression is on (threshold > 0).
+func (s Session) AutoCompressEnabled() bool {
+	if s.AutoCompressThreshold == nil {
+		return true
+	}
+	return *s.AutoCompressThreshold > 0
 }
 
 // Default returns a configuration with sane defaults and no providers.
@@ -333,6 +369,9 @@ func (c *Config) Merge(over *Config) {
 	if over.Session.HistoryLimit != 0 {
 		c.Session.HistoryLimit = over.Session.HistoryLimit
 	}
+	if over.Session.AutoCompressThreshold != nil {
+		c.Session.AutoCompressThreshold = over.Session.AutoCompressThreshold
+	}
 	if over.Sandbox.Backend != "" {
 		c.Sandbox.Backend = over.Sandbox.Backend
 	}
@@ -383,6 +422,10 @@ func (c *Config) applyDefaults() {
 	if c.Session.HistoryLimit == 0 {
 		c.Session.HistoryLimit = DefaultHistoryLimit
 	}
+	if c.Session.AutoCompressThreshold == nil {
+		t := DefaultAutoCompressThreshold
+		c.Session.AutoCompressThreshold = &t
+	}
 	if c.Sandbox.Backend == "" {
 		c.Sandbox.Backend = "none"
 	}
@@ -412,6 +455,12 @@ func (c *Config) Validate() error {
 		if p.Model == "" {
 			return fmt.Errorf("provider %q is missing a model", p.Name)
 		}
+		if p.ContextWindow < 0 {
+			return fmt.Errorf("provider %q: context_window must not be negative", p.Name)
+		}
+	}
+	if t := c.Session.AutoCompressThreshold; t != nil && (*t < 0 || *t > 100) {
+		return fmt.Errorf("session.auto_compress_threshold must be a percentage 0..100 (0 disables), got %d", *t)
 	}
 	if !names[c.DefaultProvider] {
 		return fmt.Errorf("default_provider %q does not match any configured provider", c.DefaultProvider)

@@ -152,3 +152,50 @@ streamed token. Hook timeouts kill the whole`sh`process group (Setpgid +`cmd.Can
   forks), so a timed-out hook blocked the caller — now a process-group kill +
   WaitDelay; (3) `after_model` fired once per streamed token (134 shell
   spawns per turn) — now once per model generation like `before_model`.
+
+## Context compression (Phase 6, 2026-09-04)
+
+- UI shows a live `ctx` usage readout, ALWAYS visible right-aligned on the
+  status line (`statusLine` + `contextReadout`), e.g. `ctx ≈12% · 30k/262k
+used · 232k free`. Exactness: garess asks for the usage chunk on every
+  streamed call via OpenAI `stream_options.include_usage` (internal/llm
+  `buildChatRequest`), so `usage.prompt_tokens` is exact after every model
+  call on servers that honor it (llama.cpp does). Servers that don't fall
+  back to a local estimate (≈1 token / 4 chars over events + preamble,
+  `estimatedPromptTokens` run after any turn that saw no usage) — those show
+  an `≈`. Window = provider `context_window` config → `/v1/models` probe
+  at launch (cmd/garess `resolveContextWindows`) → `DefaultContextWindow`
+  (128k, marked `≈`). New config: `providers[].context_window`,
+  `session.auto_compress_threshold` (percent, default 80, 0 = off;
+  `*int` so 0 can disable — merge copies non-nil pointers).
+- Auto-compress runs at TURN BOUNDARIES only: after each completed
+  user↔assistant turn (`finishStreaming`) when the estimate is at/over the
+  threshold, and as a backstop in `send()` when the context is ALREADY at/over
+  the threshold (the pending message itself is not compressible, so its size
+  does not trigger). One user message = one `runner.Run` holding
+  the whole tool loop; ADK v2.2.0 has no in-loop compaction hook, so there is
+  NO mid-loop compression. Giant tool outputs are bounded at the source:
+  `bash`/`read_file` results are capped (`tools.MaxToolOutputChars` 32k,
+  `capOutput`). Manual `/compress [instructions]` + `/compact` alias.
+- Compression is **full-transcript-preserving**: `chat.Service.Compact`
+  appends a summary event (author `user`) and records the latest
+  `compaction{SummaryEventID, CoveredThroughEventID}` in the `<id>.meta.json`
+  sidecar; `Get`/`List` filter the model's view to `[summary] + events after
+CoveredThroughEventID` (summary sticky under `history_limit`) — the JSONL
+  keeps everything. Each new compaction covers a prefix that includes the
+  previous summary, so only the latest marker matters. `internal/compress`
+  picks the cutoff (keep the last user exchange verbatim so tool call/result
+  pairs never split), flattens the transcript (thinking omitted), and
+  summarizes via a sideband non-streaming model call through the provider's
+  `LLMModel` (new `harness.Provider.LLMModel` + `.SessionService`).
+- The summary renders as a distinct block (not a user bubble) via
+  `Model.summaryEventID`; while a compression runs, an in-conversation
+  indicator (`compressionIndicator`, rendered in the conversation area above
+  the composer — the only compression indicator; the status bar stays plain)
+  shows activity — wording differs by `compressIsAuto` (manual says
+  "compressing context", auto "auto-compressing context"). On completion an
+  ephemeral
+  card reports the digest: `Context: X → Y tokens (freed Z) · usage a% → b%
+of W` (grouped numbers, 1-decimal % < 10). Keys are gated while
+  `compressing` (esc cancels, pending pre-send text is restored on cancel).
+  Anti-thrash: `ctxNoAutoAfter` event watermark after each auto-compress.

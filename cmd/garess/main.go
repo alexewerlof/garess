@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -242,12 +243,46 @@ func runTUI(cfgPath, providerName, modelName string) error {
 		slog.Warn(sres.String())
 	}
 
-	model, err := tui.New(providers, current, cfg.TUI.Theme, "local", sessID, mem, preamble, wd, 0, 0)
+	model, err := tui.New(providers, current, cfg.TUI.Theme, "local", sessID, mem, preamble, wd, 0, 0, tui.Options{
+		AutoCompress:    cfg.Session.AutoCompressEnabled(),
+		AutoCompressPct: cfg.Session.AutoCompressThresholdPct(),
+		ContextWindows:  resolveContextWindows(cfg),
+	})
 	if err != nil {
 		return err
 	}
 	_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
 	return err
+}
+
+// contextProbeTimeout bounds each /v1/models context-window probe at startup.
+const contextProbeTimeout = 1500 * time.Millisecond
+
+// resolveContextWindows maps provider names to their context windows in
+// tokens: the configured context_window wins; providers without one are
+// probed via GET /v1/models (best effort, non-fatal, bounded) so the context
+// indicator is right without manual config.
+func resolveContextWindows(cfg *config.Config) map[string]int {
+	out := make(map[string]int, len(cfg.Providers))
+	var wg sync.WaitGroup
+	for i := range cfg.Providers {
+		p := &cfg.Providers[i]
+		if p.ContextWindow > 0 {
+			out[p.Name] = p.ContextWindow
+			continue
+		}
+		wg.Add(1)
+		go func(p *config.Provider) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), contextProbeTimeout)
+			defer cancel()
+			if w, err := llm.LookupContextWindow(ctx, p.Endpoint, config.ResolveAPIKey(p), p.Model); err == nil && w > 0 {
+				out[p.Name] = w
+			}
+		}(p)
+	}
+	wg.Wait()
+	return out
 }
 
 func runDoctor(args []string) error {
@@ -291,9 +326,42 @@ func runDoctor(args []string) error {
 	reportSandbox(cfg)
 	reportHooks(cfg)
 	reportMCP(cfg)
+	reportContext(cfg)
 	reportAgents()
 	reportSkills()
 	return nil
+}
+
+// kTokens renders a token count compactly ("128k").
+func kTokens(n int) string {
+	if n >= 1000 {
+		return fmt.Sprintf("%dk", (n+500)/1000)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// reportContext reports the context-compression settings and each provider's
+// resolved context window (configured, probed from /v1/models, or default).
+func reportContext(cfg *config.Config) {
+	fmt.Println("context:")
+	if cfg.Session.AutoCompressEnabled() {
+		fmt.Printf("  auto-compress: on (at %d%% of the context window)\n", cfg.Session.AutoCompressThresholdPct())
+	} else {
+		fmt.Println("  auto-compress: off (threshold 0)")
+	}
+	windows := resolveContextWindows(cfg)
+	for i := range cfg.Providers {
+		p := &cfg.Providers[i]
+		w := windows[p.Name]
+		src := "probed /v1/models"
+		if p.ContextWindow > 0 {
+			src = "configured"
+		} else if w == 0 {
+			w = config.DefaultContextWindow
+			src = fmt.Sprintf("not advertised — default %s (configure context_window for accuracy)", kTokens(w))
+		}
+		fmt.Printf("  %-14s context window: %s tokens (%s)\n", p.Name+":", kTokens(w), src)
+	}
 }
 
 func maskKey(k string) string {

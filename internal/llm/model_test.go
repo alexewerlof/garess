@@ -41,7 +41,10 @@ type capturedRequest struct {
 			Parameters  map[string]any `json:"parameters"`
 		} `json:"function"`
 	} `json:"tools"`
-	Stream bool `json:"stream"`
+	Stream        bool `json:"stream"`
+	StreamOptions *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
 }
 
 func newTestModel(t *testing.T, server *httptest.Server) *ChatCompletionsModel {
@@ -161,6 +164,9 @@ func TestGenerateContentStreaming(t *testing.T) {
 
 	if got.Stream != true {
 		t.Errorf("stream = %v, want true", got.Stream)
+	}
+	if got.StreamOptions == nil || !got.StreamOptions.IncludeUsage {
+		t.Error("streaming request should ask for usage via stream_options.include_usage")
 	}
 	if got.Model != "test-model" {
 		t.Errorf("model = %q, want configured test-model", got.Model)

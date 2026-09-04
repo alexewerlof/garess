@@ -39,6 +39,34 @@ app.
 | `/skills`                         | show installed skills                                                                    |
 | `/skills reload`                  | re-read skills from disk                                                                 |
 | `/tools`                          | show the current tool policy and the built-in tools                                      |
+| `/compress [instructions]`        | compress the conversation into a summary (`/compact` works too)                          |
+
+## Context usage and compression
+
+The status bar (bottom line) always shows a `ctx` readout with the context
+usage of the current session — for example `ctx ≈12% · 30k/262k used · 232k
+free` (≈ means the value is an estimate or the window is a fallback guess; set
+the provider's `context_window` for accuracy). After the first reply you know
+exactly how much room is left: garess asks the server for real token usage on
+every response (`stream_options.include_usage`, supported by llama.cpp and
+most OpenAI-compatible servers) and shows those exact numbers. If a server
+cannot report usage, garess estimates it locally (≈1 token per 4 characters
+over the conversation + instructions) and marks it with `≈`.
+
+When usage reaches the auto-compress threshold (default 80% of the window —
+see [`configuration.md`](configuration.md)), garess compresses automatically
+after the turn: an in-conversation indicator in the history area (above the
+input box) shows `auto-compressing context…`, then a card reports the result
+(`Context: 1,024 → 337 tokens (freed 687) · usage 0.4% → 0.1% of 262k`).
+Auto-compression runs after every completed turn and, as a backstop, before
+a message you send while the context is already over the threshold.
+
+`/compress [instructions]` (or `/compact`) compresses on demand (the status
+shows `compressing context…`); the optional instructions tell the summarizer
+what to preserve (e.g. `/compress keep the API design decisions`). Older
+exchanges become one compact digest and the most recent exchange stays
+verbatim — what you see is exactly what the model sees next. The full JSONL
+transcript is preserved on disk; only the model's view is compacted.
 
 ## Memory notes
 
