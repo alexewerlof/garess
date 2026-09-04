@@ -13,10 +13,12 @@ import (
 	"google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/tool"
 
 	"garess/internal/config"
 	"garess/internal/hooks"
 	"garess/internal/llm"
+	"garess/internal/mcp"
 	"garess/internal/memory"
 	"garess/internal/tools"
 )
@@ -51,6 +53,10 @@ type Options struct {
 	// Hooks are git-style shell hooks fired on agent/tool/model/session
 	// events. Empty means no plugin is registered. See internal/hooks.
 	Hooks []config.Hook
+	// MCPServers are MCP servers ([[mcp_servers]]) whose tools are exposed
+	// alongside the built-ins. Empty means no MCP toolsets are registered.
+	// See internal/mcp.
+	MCPServers []config.MCPServer
 	// Preamble returns the current AGENTS.md/SYSTEM.md/skills instruction
 	// text. It is re-evaluated on every run, so /agents reload just swaps the
 	// backing data.
@@ -77,6 +83,17 @@ func Build(pc config.Provider, opts Options) (*Provider, error) {
 		return nil, fmt.Errorf("harness: build tools: %w", err)
 	}
 
+	// Optional MCP servers: each becomes an ADK toolset whose tools ride the
+	// same deny/ask policy as the built-ins (see internal/mcp). Empty config
+	// means no toolsets, so there is zero per-run overhead.
+	var toolsets []tool.Toolset
+	if len(opts.MCPServers) > 0 {
+		toolsets, err = mcp.BuildToolsets(opts.MCPServers, opts.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("harness: build mcp toolsets: %w", err)
+		}
+	}
+
 	maxIter := opts.MaxToolIterations
 	if maxIter <= 0 {
 		maxIter = DefaultMaxToolIterations
@@ -87,6 +104,7 @@ func Build(pc config.Provider, opts Options) (*Provider, error) {
 		Description: "A local coding assistant that runs shell commands and inspects files.",
 		Model:       m,
 		Tools:       builtinTools,
+		Toolsets:    toolsets,
 		InstructionProvider: func(ctx agent.ReadonlyContext) (string, error) {
 			if opts.Preamble == nil {
 				return "", nil

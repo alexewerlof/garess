@@ -42,6 +42,7 @@ Finish changes with `go build ./... && go test ./...`; keep `gofmt` clean
 | `internal/harness/` | ADK agent + runner wiring (tools, policy, hooks plugin)                               |
 | `internal/hooks/`   | Git-style shell hooks (config `[[hooks]]`, ADK plugin, exit-code abort)               |
 | `internal/llm/`     | Custom ADK `model.LLM` over OpenAI-compatible chat completions (no SDK)               |
+| `internal/mcp/`     | MCP server client: `[[mcp_servers]]` config → ADK toolsets (stdio/sse/http, auth)     |
 | `internal/memory/`  | Local + global memory notes                                                           |
 | `internal/sandbox/` | Landlock tool sandbox (Phase 4): write confinement, none/auto/landlock backends       |
 | `internal/skills/`  | Skill pack discovery + rendering (user/project/launch-dir roots)                      |
@@ -131,6 +132,14 @@ streamed token. Hook timeouts kill the whole`sh`process group (Setpgid +`cmd.Can
   the kernel has no Landlock (ABI <= 0) or ABI < 6; `auto` degrades to `none`.
   Raw x/sys/unix syscalls, no go-landlock
   (its libcap/psx dep needs cgo, breaking the armv6 build).
+- MCP support — `[[mcp_servers]]` config entries (`internal/mcp`) become ADK
+  toolsets on the agent: transports `stdio`/`sse`/`http`, optional per-server
+  `headers`, `GARESS_MCP_<NAME>_TOKEN` env override (wins over an inline
+  Authorization header). Servers are contacted lazily; toolsets are resolved
+  per run and an unreachable server DEGRADES to no tools (warning logged,
+  `Server.Status`) instead of failing the turn. MCP calls ride the same
+  deny/ask policy as built-ins. `garess doctor` lists each server's tools.
+  Depends on `github.com/modelcontextprotocol/go-sdk` (pure Go, armv6-safe).
 - Phase 5 — on-device validation on the Raspberry Pi 1 (kernel 6.18 rpi-v6,
   armv6l). ✅ Doctor/connect/hooks/sandbox verified over SSH; the full test
   suites for sandbox, hooks and harness run green cross-compiled on the Pi

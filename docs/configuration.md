@@ -25,6 +25,7 @@ overridden wholesale, with per-event and per-list semantics documented below.
 | `GA_RESS_API_KEY`                                            | API key; wins over the `api_key` config field                           |
 | `GARESS_TOOL_ALLOW` / `GARESS_TOOL_ASK` / `GARESS_TOOL_DENY` | tool approval regexes (`;`-separated) — see [Safety model](safety.md)   |
 | `GARESS_SANDBOX`                                             | override the `[sandbox] backend` for one run (`none`/`auto`/`landlock`) |
+| `GARESS_MCP_<NAME>_TOKEN`                                    | bearer token for the MCP server `NAME` (wins over an inline header)     |
 
 ## Top level
 
@@ -62,6 +63,59 @@ history_limit = 40   # conversation messages kept in the model context
 
 Older events stay in the transcript on disk; only the most recent
 `history_limit` messages are sent to the model.
+
+## MCP servers
+
+MCP (Model Context Protocol) servers expose their tools to the agent
+alongside the built-ins. Each server is a `[[mcp_servers]]` entry; a project
+config replaces the global entry with the same name.
+
+```toml
+[[mcp_servers]]
+name       = "crawl4ai"              # unique; also the env-token lookup key
+url        = "http://crawl-host:11235/mcp/sse"
+headers    = { Authorization = "Bearer your-token" }   # optional
+```
+
+### Transports
+
+`transport` selects how garess talks to the server (required):
+
+| Transport | Target                  | Use for                                 |
+| --------- | ----------------------- | --------------------------------------- |
+| `sse`     | `url` (SSE endpoint)    | Docker-hosted servers (e.g. `/mcp/sse`) |
+| `http`    | `url` (streamable HTTP) | modern MCP HTTP servers                 |
+| `stdio`   | `command` (+ `args`)    | local subprocess servers                |
+
+```toml
+[[mcp_servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { }   # optional extra env for the subprocess
+```
+
+### Auth
+
+`sse`/`http` servers get the `headers` map on every request. Set the
+`GARESS_MCP_<NAME>_TOKEN` environment variable (NAME uppercased,
+non-alphanumeric runes become `_`) to send `Authorization: Bearer <token>` —
+it wins over an inline `Authorization` header:
+
+```sh
+GARESS_MCP_CRAWL4AI_TOKEN=… garess
+```
+
+### Behaviour
+
+- Servers are contacted lazily — startup is never blocked by a configured
+  server.
+- An **unreachable server is skipped for that turn** (its tools are missing;
+  a warning goes to the log) instead of failing the run.
+- `garess doctor` lists each configured server and the tools it exposes.
+- MCP tool calls ride the same allow/ask/deny policy as the built-ins (see
+  [Safety model](safety.md)).
 
 ## Hooks
 

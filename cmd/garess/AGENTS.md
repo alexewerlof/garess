@@ -15,15 +15,17 @@ CLI entry point, flag parsing and subcommands.
   (`harness.Build`), plus the memory store, the ADK session service
   (`chat.NewService`), a fresh session id, and a shared `harness.Preamble`,
   then passes everything to `tui.New`. `--model` mutates the current
-  provider's config before building. `cfg.Hooks` flows through
-  `harness.Options.Hooks` into the runner plugin. The Phase 4 sandbox is
-  applied last (`sandbox.Apply`, `GARESS_SANDBOX` env overrides the backend)
-  right before `tui.New` — whole-process and irreversible, so after every
-  directory exists; an explicit `landlock` backend that cannot apply aborts
-  startup.
+  provider's config before building. `cfg.Hooks` and `cfg.MCPServers` flow
+  through `harness.Options` (the latter → ADK toolsets, `internal/mcp`). The
+  Phase 4 sandbox is applied last (`sandbox.Apply`, `GARESS_SANDBOX` env
+  overrides the backend) right before `tui.New` — whole-process and
+  irreversible, so after every directory exists; an explicit `landlock`
+  backend that cannot apply aborts startup.
 - `runDoctor` pings the default provider via `llm.Ping`, lists models via
   `llm.ListModels` (both hit `GET /v1/models`), and reports sandbox support
-  (`sandbox.Available()` ABI probe), configured hooks (`reportHooks`), and
-  applicable AGENTS.md / SYSTEM.md files.
+  (`sandbox.Available()` ABI probe), configured hooks (`reportHooks`),
+  configured MCP servers with their tools (`reportMCP`, via
+  `mcp.ListTools` — failures are printed, not fatal), and applicable
+  AGENTS.md / SYSTEM.md files.
 - Structured logs go to a file (`~/.config/garess/garess.log`) via `slog` so
   the TUI owns stdout. Put new diagnostics in `doctor`, not on stdout.

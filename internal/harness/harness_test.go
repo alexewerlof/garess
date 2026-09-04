@@ -2,14 +2,17 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/agent"
@@ -379,5 +382,182 @@ func TestHookAfterModelFiresOncePerModelCall(t *testing.T) {
 	}
 	if reqCount != 2 {
 		t.Errorf("server requests = %d, want 2", reqCount)
+	}
+}
+
+// ---- MCP end-to-end tests (in-process fake MCP server, no network) ----
+
+type mcpScrapeArgs struct {
+	URL string `json:"url"`
+}
+
+func mcpScrape(ctx context.Context, req *mcp.CallToolRequest, args mcpScrapeArgs) (*mcp.CallToolResult, any, error) {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: "markdown for " + args.URL}},
+	}, nil, nil
+}
+
+// startFakeMCPServer starts an SSE MCP server exposing a scrape tool.
+func startFakeMCPServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := mcp.NewServer(&mcp.Implementation{Name: "fake-crawl", Version: "v1"}, nil)
+	mcp.AddTool(server, &mcp.Tool{Name: "scrape", Description: "scrape one URL to markdown"}, mcpScrape)
+	handler := mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	ts := httptest.NewServer(handler)
+	// The toolset keeps the SSE stream open for its lifetime, so force-close
+	// lingering connections before shutting the server down.
+	t.Cleanup(func() {
+		ts.CloseClientConnections()
+		ts.Close()
+	})
+	return ts
+}
+
+// TestMCPToolLoopOverSSE drives the full agentic loop against a configured MCP
+// server: the MCP tool declarations reach the model's wire request, the model
+// calls one, and the result is fed back into the final reply.
+func TestMCPToolLoopOverSSE(t *testing.T) {
+	mcpServer := startFakeMCPServer(t)
+
+	reqCount := 0
+	var (
+		mu   sync.Mutex
+		seen []string // function names present in each wire request's tools
+	)
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount++
+		var body struct {
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+		}
+		// Best-effort: record which tools the model saw (skip decode errors).
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			mu.Lock()
+			for _, tt := range body.Tools {
+				seen = append(seen, tt.Function.Name)
+			}
+			mu.Unlock()
+		}
+		switch reqCount {
+		case 1:
+			sse(w, toolCallChunk("scrape", "call_m1", `{"url":"https://example.com"}`), finishChunk("tool_calls"), "[DONE]")
+		case 2:
+			sse(w, contentChunk("done"), finishChunk("stop"), "[DONE]")
+		default:
+			t.Errorf("unexpected request %d", reqCount)
+		}
+	}))
+	defer modelServer.Close()
+
+	svc := chat.NewService(t.TempDir(), 1000)
+	p, err := Build(config.Provider{Name: "test", Endpoint: modelServer.URL + "/v1", APIKey: "k", Model: "m"}, Options{
+		SessionService: svc,
+		Preamble:       func() (string, error) { return "You are a test agent.", nil },
+		MCPServers: []config.MCPServer{{
+			Name:      "crawl",
+			Transport: config.MCPTransportSSE,
+			URL:       mcpServer.URL,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	events, err := runCollect(context.Background(), p.Runner, "local", "mcp1", genai.NewContentFromText("scrape example.com", genai.RoleUser))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var scrapeCall, scrapeResp, finalText bool
+	for _, ev := range events {
+		for _, part := range ev.Content.Parts {
+			switch {
+			case part.FunctionCall != nil && part.FunctionCall.Name == "scrape":
+				scrapeCall = true
+			case part.FunctionResponse != nil && part.FunctionResponse.Name == "scrape":
+				scrapeResp = true
+				if out, ok := part.FunctionResponse.Response["output"].(string); !ok || !strings.Contains(out, "markdown for https://example.com") {
+					t.Errorf("scrape output = %v, want markdown for https://example.com", part.FunctionResponse.Response)
+				}
+			case part.Text != "" && !part.Thought && part.Text == "done":
+				finalText = true
+			}
+		}
+	}
+	if !scrapeCall || !scrapeResp || !finalText {
+		t.Errorf("MCP loop incomplete: call=%v resp=%v final=%v", scrapeCall, scrapeResp, finalText)
+	}
+	if reqCount != 2 {
+		t.Errorf("model server requests = %d, want 2", reqCount)
+	}
+
+	// The MCP tool must have been in the wire request the model saw.
+	mu.Lock()
+	defer mu.Unlock()
+	hasScrape, hasBuiltin := false, false
+	for _, n := range seen {
+		if n == "scrape" {
+			hasScrape = true
+		}
+		if n == "bash" {
+			hasBuiltin = true
+		}
+	}
+	if !hasScrape {
+		t.Errorf("wire tools = %v, want scrape (MCP tool) present", seen)
+	}
+	if !hasBuiltin {
+		t.Errorf("wire tools = %v, want built-in tools still present", seen)
+	}
+}
+
+// TestMCPUnreachableStillRuns proves an unreachable MCP server degrades: the
+// run proceeds (without the MCP tools) instead of failing.
+func TestMCPUnreachableStillRuns(t *testing.T) {
+	mcpServer := startFakeMCPServer(t)
+	deadURL := mcpServer.URL
+	mcpServer.Close() // unreachable now
+
+	reqCount := 0
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount++
+		sse(w, contentChunk("hello"), finishChunk("stop"), "[DONE]")
+	}))
+	defer modelServer.Close()
+
+	svc := chat.NewService(t.TempDir(), 1000)
+	p, err := Build(config.Provider{Name: "test", Endpoint: modelServer.URL + "/v1", APIKey: "k", Model: "m"}, Options{
+		SessionService: svc,
+		Preamble:       func() (string, error) { return "You are a test agent.", nil },
+		MCPServers: []config.MCPServer{{
+			Name:      "crawl",
+			Transport: config.MCPTransportSSE,
+			URL:       deadURL,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	events, err := runCollect(context.Background(), p.Runner, "local", "mcp2", genai.NewContentFromText("hi", genai.RoleUser))
+	if err != nil {
+		t.Fatalf("Run must degrade, not fail: %v", err)
+	}
+	var gotText bool
+	for _, ev := range events {
+		for _, part := range ev.Content.Parts {
+			if part.Text != "" && !part.Thought && part.Text == "hello" {
+				gotText = true
+			}
+		}
+	}
+	if !gotText {
+		t.Error("run did not complete with an unreachable MCP server")
+	}
+	if reqCount != 1 {
+		t.Errorf("model server requests = %d, want 1", reqCount)
 	}
 }

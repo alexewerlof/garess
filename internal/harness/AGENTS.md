@@ -8,6 +8,12 @@ Wires a config provider into a Google ADK agent + runner.
   shared `Preamble`), `tools.DenyCallback` (deny policy), and an
   iteration-cap `BeforeModelCallback`. `opts.Preamble` is a `func() (string,
 error)`; use `Preamble.Get` so `/agents reload` works without rebuilding.
+- `opts.MCPServers` (`[]config.MCPServer`) are converted to ADK toolsets via
+  `mcp.BuildToolsets` (each gated by the same ask policy) and registered as
+  `llmagent.Config.Toolsets` — only when non-empty, so there is zero overhead
+  with no `[[mcp_servers]]` configured. Deny is enforced by the shared
+  `DenyCallback`. An unreachable server degrades to no tools for that turn
+  (never fails the run).
 - `Preamble` is a thread-safe holder for the system-instruction text
   (AGENTS.md/SYSTEM.md + skills).
 - The iteration cap counts model calls per invocation via a `temp:garessModelCalls`

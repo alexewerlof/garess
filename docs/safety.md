@@ -68,6 +68,13 @@ How each decision is enforced:
 Built-ins: `bash`, `read_file`, `write_file`, `glob`, `grep`,
 `memory_read`, `memory_write`, `memory_list`, `memory_delete`.
 
+MCP servers (see [Configuration](configuration.md)) expose external tools
+that are treated like any other tool: **deny/ask/allow rules match MCP tool
+calls too**, using the same `<name> <key>=<value> …` target. There is no
+separate sandbox for them — a configured MCP server runs its own code
+remotely, so treat it as trusted. An unreachable MCP server is skipped for
+that turn rather than failing the run.
+
 ## 2. Hooks as gates
 
 Hooks are shell commands you configure (see

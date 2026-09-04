@@ -108,4 +108,5 @@ garess --provider deepseek                       # at launch
 ```
 
 `garess doctor` is the fastest way to check a provider's endpoint before you
-start chatting.
+start chatting. It also lists the configured hooks, MCP servers (with the
+tools each exposes) and the AGENTS.md/SYSTEM.md files that apply.

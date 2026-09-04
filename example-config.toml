@@ -98,3 +98,35 @@ history_limit = 40                      # messages kept in the model context
 # [sandbox]
 # backend = "auto"
 # write_dirs = ["/home/you/.cache"]
+
+# ---------------------------------------------------------------------------
+# MCP servers (Model Context Protocol). Optional — omit the whole section for
+# no MCP tools. Each [[mcp_servers]] entry exposes a server's tools to the
+# agent alongside the built-ins. An unreachable server is skipped for that
+# turn (chat keeps working); `garess doctor` lists each server's tools.
+#
+# transport (required):
+#   stdio  - spawn a local command (command + optional args/env)
+#   sse    - connect to a Server-Sent Events endpoint (url)
+#   http   - connect to a streamable HTTP endpoint (url)
+#
+# headers are sent on every request to sse/http servers (e.g. Authorization).
+# The GARESS_MCP_<NAME>_TOKEN env var (NAME uppercased, non-alnum -> _) sets
+# Authorization: Bearer <token> and wins over an inline header.
+#
+# Project config replaces the global entry with the same name.
+# ---------------------------------------------------------------------------
+# Remote server over SSE (e.g. a self-hosted Crawl4AI Docker server):
+# [[mcp_servers]]
+# name = "crawl4ai"
+# transport = "sse"
+# url = "http://crawl-host:11235/mcp/sse"
+# headers = { Authorization = "Bearer your-token" }
+#
+# Local subprocess server (stdio):
+# [[mcp_servers]]
+# name = "filesystem"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+

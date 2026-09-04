@@ -441,3 +441,198 @@ func TestMergeHooksProjectOverridesPerEvent(t *testing.T) {
 		t.Fatalf("nil overlay changed hooks: %+v", again)
 	}
 }
+
+func TestMCPDecode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	write(t, p, `
+[[providers]]
+name = "x"
+endpoint = "https://x.example/v1"
+model = "m"
+
+[[mcp_servers]]
+name = "scraper"
+transport = "sse"
+url = "http://scraper.local:9000/mcp/sse"
+headers = { Authorization = "Bearer tok" }
+
+[[mcp_servers]]
+name = "local-fs"
+transport = "stdio"
+command = "/usr/bin/npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { NODE_ENV = "production" }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.MCPServers) != 2 {
+		t.Fatalf("got %d mcp_servers, want 2: %+v", len(cfg.MCPServers), cfg.MCPServers)
+	}
+	s := cfg.MCPServers[0]
+	if s.Name != "scraper" || s.Transport != MCPTransportSSE || s.URL != "http://scraper.local:9000/mcp/sse" {
+		t.Fatalf("server 0 = %+v", s)
+	}
+	if s.Headers["Authorization"] != "Bearer tok" {
+		t.Fatalf("server 0 headers = %+v", s.Headers)
+	}
+	fs := cfg.MCPServers[1]
+	if fs.Name != "local-fs" || fs.Transport != MCPTransportStdio || fs.Command != "/usr/bin/npx" {
+		t.Fatalf("server 1 = %+v", fs)
+	}
+	if len(fs.Args) != 3 || fs.Args[0] != "-y" {
+		t.Fatalf("server 1 args = %+v", fs.Args)
+	}
+	if fs.Env["NODE_ENV"] != "production" {
+		t.Fatalf("server 1 env = %+v", fs.Env)
+	}
+}
+
+func TestMergeMCPServersProjectOverridesByName(t *testing.T) {
+	dir := t.TempDir()
+	global := filepath.Join(dir, "global.toml")
+	project := filepath.Join(dir, "project.toml")
+
+	write(t, global, `
+[[providers]]
+name = "a"
+endpoint = "https://a.example/v1"
+model = "ma"
+[[mcp_servers]]
+name = "shared"
+transport = "sse"
+url = "http://global:9000/mcp/sse"
+[[mcp_servers]]
+name = "only-global"
+transport = "stdio"
+command = "tool-global"
+`)
+	write(t, project, `
+[[providers]]
+name = "a"
+endpoint = "https://a.example/v1"
+model = "ma"
+[[mcp_servers]]
+name = "shared"
+transport = "sse"
+url = "http://project:9000/mcp/sse"
+`)
+
+	cfg, found, err := loadFrom(global, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected config files to be found")
+	}
+	if len(cfg.MCPServers) != 2 {
+		t.Fatalf("got %d mcp_servers, want 2 (only-global survives, shared replaced): %+v", len(cfg.MCPServers), cfg.MCPServers)
+	}
+	byName := map[string]MCPServer{}
+	for _, s := range cfg.MCPServers {
+		byName[s.Name] = s
+	}
+	if byName["shared"].URL != "http://project:9000/mcp/sse" {
+		t.Fatalf("project should override shared: %+v", byName["shared"])
+	}
+	if byName["only-global"].Command != "tool-global" {
+		t.Fatalf("only-global should survive from global: %+v", byName["only-global"])
+	}
+}
+
+func TestMCPValidation(t *testing.T) {
+	base := `
+[[providers]]
+name = "x"
+endpoint = "https://x.example/v1"
+model = "m"
+`
+	valid := func(extra string) string { return base + extra }
+	cases := []struct {
+		name    string
+		section string
+		want    string
+	}{
+		{"missing name", `
+[[mcp_servers]]
+transport = "sse"
+url = "http://h:1/mcp/sse"`, "missing a name"},
+		{"missing transport", `
+[[mcp_servers]]
+name = "x"
+url = "http://h:1/mcp/sse"`, "missing a transport"},
+		{"bad transport", `
+[[mcp_servers]]
+name = "x"
+transport = "carrier-pigeon"
+url = "http://h:1/mcp/sse"`, "transport must be one of stdio|sse|http"},
+		{"stdio without command", `
+[[mcp_servers]]
+name = "x"
+transport = "stdio"`, "missing a command"},
+		{"sse without url", `
+[[mcp_servers]]
+name = "x"
+transport = "sse"`, "endpoint"},
+		{"http bad url", `
+[[mcp_servers]]
+name = "x"
+transport = "http"
+url = "not-a-url"`, "endpoint"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "c.toml")
+			write(t, p, valid(c.section))
+			_, err := Load(p)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want containing %q", err, c.want)
+			}
+		})
+	}
+
+	// All three transports validate.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ok.toml")
+	write(t, p, valid(`
+[[mcp_servers]]
+name = "sse"
+transport = "sse"
+url = "http://h:1/mcp/sse"
+[[mcp_servers]]
+name = "http"
+transport = "http"
+url = "https://h:2/mcp"
+[[mcp_servers]]
+name = "stdio"
+transport = "stdio"
+command = "tool"
+args = ["-x"]
+env = { A = "1" }
+`))
+	if _, err := Load(p); err != nil {
+		t.Fatalf("valid mcp_servers rejected: %v", err)
+	}
+
+	// Empty list is fine (MCP is optional).
+	p2 := filepath.Join(t.TempDir(), "ok2.toml")
+	write(t, p2, valid(""))
+	if _, err := Load(p2); err != nil {
+		t.Fatalf("config without mcp_servers rejected: %v", err)
+	}
+}
+
+func TestValidateMCPServersDuplicateNames(t *testing.T) {
+	// Merge dedupes TOML files by name, but programmatic construction can
+	// still produce duplicates — Validate must reject them.
+	err := validateMCPServers([]MCPServer{
+		{Name: "a", Transport: MCPTransportSSE, URL: "http://h:1/mcp/sse"},
+		{Name: "a", Transport: MCPTransportStdio, Command: "x"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate mcp_server name") {
+		t.Fatalf("err = %v, want duplicate mcp_server name", err)
+	}
+}

@@ -24,6 +24,7 @@ import (
 	"garess/internal/config"
 	"garess/internal/harness"
 	"garess/internal/llm"
+	"garess/internal/mcp"
 	"garess/internal/memory"
 	"garess/internal/sandbox"
 	"garess/internal/skills"
@@ -205,6 +206,7 @@ func runTUI(cfgPath, providerName, modelName string) error {
 		SessionService: svc,
 		Policy:         tools.DefaultPolicy(),
 		Hooks:          cfg.Hooks,
+		MCPServers:     cfg.MCPServers,
 		Preamble:       preamble.Get,
 	}
 	providers := make(map[string]*harness.Provider, len(cfg.Providers))
@@ -288,6 +290,7 @@ func runDoctor(args []string) error {
 	}
 	reportSandbox(cfg)
 	reportHooks(cfg)
+	reportMCP(cfg)
 	reportAgents()
 	reportSkills()
 	return nil
@@ -326,6 +329,35 @@ func reportSandbox(cfg *config.Config) {
 	fmt.Printf("  backend:     %s\n", backend)
 	if len(cfg.Sandbox.WriteDirs) > 0 {
 		fmt.Printf("  write dirs:  %s\n", strings.Join(cfg.Sandbox.WriteDirs, ", "))
+	}
+}
+
+// reportMCP lists the configured MCP servers and, for each, connects and
+// reports the tools the agent would get. A failing server is reported (with
+// the reason) but does not fail doctor — at run time it degrades to no tools.
+func reportMCP(cfg *config.Config) {
+	if len(cfg.MCPServers) == 0 {
+		fmt.Println("mcp_servers: none configured")
+		return
+	}
+	fmt.Println("mcp_servers:")
+	for _, s := range cfg.MCPServers {
+		target := s.URL
+		if s.Transport == config.MCPTransportStdio {
+			target = s.Command
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		names, err := mcp.ListTools(ctx, s)
+		cancel()
+		if err != nil {
+			fmt.Printf("  %-16s %s %s: FAIL — %v\n", s.Name, s.Transport, target, err)
+			continue
+		}
+		if len(names) == 0 {
+			fmt.Printf("  %-16s %s %s: no tools\n", s.Name, s.Transport, target)
+			continue
+		}
+		fmt.Printf("  %-16s %s %s: %s\n", s.Name, s.Transport, target, strings.Join(names, ", "))
 	}
 }
 

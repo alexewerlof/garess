@@ -62,6 +62,9 @@ type Config struct {
 	Hooks []Hook `toml:"hooks"`
 	// Sandbox holds the Landlock tool-sandbox options (Phase 4).
 	Sandbox Sandbox `toml:"sandbox"`
+	// MCPServers are MCP (Model Context Protocol) servers whose tools are
+	// exposed to the agent alongside the built-ins.
+	MCPServers []MCPServer `toml:"mcp_servers"`
 
 	// Warnings are non-fatal notes collected while decoding (e.g. unknown keys).
 	Warnings []string `toml:"-"`
@@ -104,6 +107,45 @@ type Hook struct {
 	// Timeout bounds the hook run (Go duration, e.g. "5s"). Empty means the
 	// hooks package default (10s).
 	Timeout string `toml:"timeout"`
+}
+
+// MCP transport names. stdio spawns a local subprocess; sse and http connect
+// to a remote endpoint (Server-Sent Events and streamable HTTP respectively).
+const (
+	// MCPTransportStdio spawns a local command and speaks MCP over its
+	// stdin/stdout.
+	MCPTransportStdio = "stdio"
+	// MCPTransportSSE connects to a Server-Sent Events endpoint.
+	MCPTransportSSE = "sse"
+	// MCPTransportHTTP connects to a streamable HTTP endpoint.
+	MCPTransportHTTP = "http"
+)
+
+// MCPTransports lists the accepted mcp_servers.transport values.
+var MCPTransports = []string{MCPTransportStdio, MCPTransportSSE, MCPTransportHTTP}
+
+// MCPServer describes one MCP server to expose to the agent. See the
+// internal/mcp package for the client wiring and the graceful-degradation
+// semantics (an unreachable server skips its tools for the turn instead of
+// failing the run).
+type MCPServer struct {
+	// Name is a unique identifier used in logs, doctor output and the
+	// GARESS_MCP_<NAME>_TOKEN environment lookup (name uppercased).
+	Name string `toml:"name"`
+	// Transport selects the connection: stdio | sse | http.
+	Transport string `toml:"transport"`
+	// URL is the endpoint for sse and http transports.
+	URL string `toml:"url"`
+	// Command is the executable to spawn for the stdio transport.
+	Command string `toml:"command"`
+	// Args are the arguments passed to Command (stdio only).
+	Args []string `toml:"args"`
+	// Env are extra environment variables for the stdio subprocess.
+	Env map[string]string `toml:"env"`
+	// Headers are extra HTTP headers sent on every request to sse/http
+	// servers. The GARESS_MCP_<NAME>_TOKEN environment variable, when set,
+	// overrides an Authorization header configured here.
+	Headers map[string]string `toml:"headers"`
 }
 
 // Provider describes a single OpenAI-compatible endpoint.
@@ -298,6 +340,19 @@ func (c *Config) Merge(over *Config) {
 		c.Sandbox.WriteDirs = over.Sandbox.WriteDirs
 	}
 	c.Hooks = mergeHooks(c.Hooks, over.Hooks)
+	for _, s := range over.MCPServers {
+		replaced := false
+		for i := range c.MCPServers {
+			if c.MCPServers[i].Name == s.Name {
+				c.MCPServers[i] = s
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			c.MCPServers = append(c.MCPServers, s)
+		}
+	}
 }
 
 // mergeHooks overlays project hooks onto global hooks: when the project
@@ -377,6 +432,40 @@ func (c *Config) Validate() error {
 		}
 		if !filepath.IsAbs(d) {
 			return fmt.Errorf("sandbox.write_dirs entry %q must be an absolute path", d)
+		}
+	}
+	if err := validateMCPServers(c.MCPServers); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateMCPServers checks the mcp_servers list for consistency: unique
+// names and transport-appropriate targets.
+func validateMCPServers(servers []MCPServer) error {
+	names := make(map[string]bool, len(servers))
+	for i := range servers {
+		s := &servers[i]
+		if s.Name == "" {
+			return fmt.Errorf("mcp_server #%d is missing a name", i+1)
+		}
+		if names[s.Name] {
+			return fmt.Errorf("duplicate mcp_server name %q", s.Name)
+		}
+		names[s.Name] = true
+		switch s.Transport {
+		case MCPTransportStdio:
+			if s.Command == "" {
+				return fmt.Errorf("mcp_server %q (stdio) is missing a command", s.Name)
+			}
+		case MCPTransportSSE, MCPTransportHTTP:
+			if err := validateEndpoint(s.URL); err != nil {
+				return fmt.Errorf("mcp_server %q: %w", s.Name, err)
+			}
+		case "":
+			return fmt.Errorf("mcp_server %q is missing a transport (one of %s)", s.Name, strings.Join(MCPTransports, "|"))
+		default:
+			return fmt.Errorf("mcp_server %q transport must be one of %s, got %q", s.Name, strings.Join(MCPTransports, "|"), s.Transport)
 		}
 	}
 	return nil

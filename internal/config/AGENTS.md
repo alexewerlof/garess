@@ -25,6 +25,12 @@ TOML configuration loading and validation.
   `none` (also set in `Default()`); `Validate` checks backend ∈
   none|auto|landlock and that `write_dirs` are absolute. Merge: project
   overrides backend and the whole write_dirs list when set.
+- `[[mcp_servers]]`: `MCPServer{Name, Transport, URL, Command, Args, Env,
+Headers}` stored as-is on `Config.MCPServers`. `Validate` checks unique
+  names and transport-appropriate targets (`stdio` needs `command`;
+  `sse`/`http` need a valid `url`); transport ∈ stdio|sse|http. Merge
+  replaces a project/global server by name (like providers). Env/header
+  semantics live in `internal/mcp`.
 - When adding a field, keep `merge`, `applyDefaults`, `Validate`, and the
   tests in sync, and mirror the change in `example-config.toml` and
   `docs/configuration.md`.
