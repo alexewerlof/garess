@@ -417,7 +417,10 @@ func TestNewSessionResets(t *testing.T) {
 		typeText(prog, "hello")
 		prog.Send(tea.KeyMsg{Type: tea.KeyEnter})
 		waitFor(t, func() bool { return len(sessionEvents(t, env.svc, env.sessID)) >= 2 })
-		// /new starts a fresh session and clears the display history.
+		drain()
+		// /new starts a fresh session and clears the display history. Keys
+		// sent while the UI is still finalizing the previous stream are
+		// swallowed (streaming swallows input), so wait for the pump to drain.
 		typeText(prog, "/new")
 		prog.Send(tea.KeyMsg{Type: tea.KeyEnter})
 		time.Sleep(50 * time.Millisecond)
