@@ -8,16 +8,18 @@ covered in the [Safety model](safety.md).
 
 ## Keys
 
-| Key                                | Effect                                                                                           |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `enter`                            | send the prompt                                                                                  |
-| `ctrl+j`                           | insert a newline in the composer                                                                 |
-| `up` / `down`                      | scroll the conversation when it overflows; otherwise move the cursor                             |
-| `pgup` / `pgdown` / `home` / `end` | scroll the conversation                                                                          |
-| `ctrl+t`                           | show / hide the model's thinking (reasoning). Thinking is captured and stored, hidden by default |
-| `esc`                              | stop the current response (or deny a pending confirmation)                                       |
-| `ctrl+c`                           | quit                                                                                             |
-| `y` / `n`                          | approve / deny a tool call that asks for confirmation                                            |
+| Key                                | Effect                                                                                             |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `enter`                            | send the prompt                                                                                    |
+| `ctrl+j`                           | insert a newline in the composer                                                                   |
+| `up` / `down`                      | scroll the conversation when it overflows; otherwise move the cursor                               |
+| `pgup` / `pgdown` / `home` / `end` | scroll the conversation                                                                            |
+| `tab`                              | focus the session list in the right rail (wide terminals); `↑↓` picks, `enter` resumes, `esc` back |
+| type `/`                           | open the slash-command palette                                                                     |
+| `ctrl+t`                           | show / hide the model's thinking (reasoning). Thinking is captured and stored, hidden by default   |
+| `esc`                              | stop the current response (or deny a pending confirmation)                                         |
+| `ctrl+c`                           | quit                                                                                               |
+| `y` / `n`                          | approve / deny a tool call that asks for confirmation                                              |
 
 ## Slash commands
 
@@ -39,6 +41,7 @@ app.
 | `/skills`                         | show installed skills                                                                    |
 | `/skills reload`                  | re-read skills from disk                                                                 |
 | `/tools`                          | show the current tool policy and the built-in tools                                      |
+| `/sessions`                       | list past sessions and resume one (`↑↓` picks, `enter` resumes, `esc` closes)            |
 | `/compress [instructions]`        | compress the conversation into a summary (`/compact` works too)                          |
 
 ## Context usage and compression
@@ -97,6 +100,20 @@ persisted as JSONL transcripts in `.garess/sessions/`:
 left on disk for reference. Streamed partials are not persisted — only
 completed events — so a transcript is a clean record of what actually
 happened, including tool calls and results.
+
+### Resuming a past session
+
+Past sessions are resumable: `/sessions` opens a picker of recent sessions
+(`↑↓` picks, `enter` resumes, `esc` closes), and on wide terminals (>= 140
+columns) a right rail lists the current session and recent past ones — press
+`tab` to move the selection there, `enter` to resume.
+
+Resuming loads the session's transcript back into the conversation view and
+points the next turn at that session: anything you send continues the resumed
+conversation in its original transcript (the model's view is history-capped
+and compaction-filtered, exactly as it would be had you never left). The
+context usage readout is re-estimated from the loaded history until the next
+model call re-anchors it.
 
 ## Steering the model: AGENTS.md, SYSTEM.md, skills
 

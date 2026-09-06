@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -86,6 +87,7 @@ type Model struct {
 	assistantThinking *streamChunker   // streaming thinking (chunked, rendered only when shown)
 	thinkingBlock     string           // frozen thinking block (stable, above the response)
 	thinkingFrozen    bool             // thinking finalized once visible text starts
+	generationPending bool             // a model generation is pending (show the live Thinking slot)
 	spinnerIdx        int
 	streamFailed      bool
 	stats             *tuiStats // GARESS_STATS=1 CPU-time breakdown (nil = disabled)
@@ -116,6 +118,23 @@ type Model struct {
 
 	err    string
 	status string
+
+	// Modern chrome / empty state.
+	version string // app version (bottom bar); "" hides it
+
+	// Slash-command palette ("/" at the start of the composer).
+	paletteShow bool // esc dismisses the palette until the next edit
+	paletteSel  int  // index into paletteRows()
+
+	// Right session rail + resume (/sessions). sessionSvc is the concrete
+	// chat service behind Options.SessionService; nil hides the rail and the
+	// picker. sessions is the cached recent-session list (nil = not loaded).
+	sessionSvc   *chat.Service
+	sessions     []chat.RecentSession
+	sessionsErr  string // last list-load error ("" = none)
+	sessionsSel  int    // highlighted entry in the rail / picker
+	sessionsShow bool   // /sessions picker is open (conv live slot)
+	railFocused  bool   // arrow keys drive the right rail list
 }
 
 // adkEvent carries one pumped runner event.
@@ -154,15 +173,32 @@ func New(providers map[string]*harness.Provider, current, theme, userID, session
 	windows := resolveWindows(providers, o)
 	cur := windows[current]
 
-	md, err := newMarkdownRenderer(maxInt(width-4, 40), theme)
+	// The session service drives the right rail and /sessions resume; it is
+	// type-asserted to the concrete chat service (like the compression flow).
+	var sessionSvc *chat.Service
+	if s, ok := o.SessionService.(*chat.Service); ok {
+		sessionSvc = s
+	}
+	// The markdown renderer wraps at the content width (terminal width minus
+	// the right rail when it is active), so wrapped lines never run under the
+	// rail column.
+	contentW := width
+	if width >= railMinWidth && sessionSvc != nil {
+		contentW = width - railWidth
+	}
+	md, err := newMarkdownRenderer(maxInt(contentW-4, 40), theme)
 	if err != nil {
 		return nil, err
 	}
+
+	resolveUI(theme) // pick the dark/light style set before any render
 	ta := textarea.New()
-	ta.Placeholder = "Message garess…  (enter: send · ctrl+j: newline · /help)"
+	ta.Prompt = "" // no prompt glyph inside the editor panel
+	ta.Placeholder = "Ask garess anything…"
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
-	ta.Focus() // focus must be set before Init (Init runs on a value copy)
+	styleTextarea(&ta, theme) // placeholder blends into the panel (no block bg)
+	ta.Focus()                // focus must be set before Init (Init runs on a value copy)
 
 	m := &Model{
 		providers:       providers,
@@ -170,13 +206,16 @@ func New(providers map[string]*harness.Provider, current, theme, userID, session
 		theme:           theme,
 		userID:          userID,
 		sessionID:       sessionID,
+		sessionSvc:      sessionSvc,
 		memory:          mem,
 		preamble:        preamble,
 		workDir:         workDir,
 		width:           width,
 		height:          height,
+		version:         o.Version,
 		textarea:        ta,
 		md:              md,
+		paletteShow:     true,
 		streamBuffer:    &strings.Builder{}, // pointer: the Model is copied by Bubble Tea on every Update
 		thinkingBuffer:  &strings.Builder{}, // pointer: see streamBuffer
 		assistantChunks: newStreamChunker(), // pointer: see streamBuffer
@@ -193,6 +232,9 @@ func New(providers map[string]*harness.Provider, current, theme, userID, session
 		m.stats = newTUIStats()
 		go m.stats.reportLoop(5 * time.Second)
 	}
+	// The composer starts empty: hide the block cursor (see
+	// reconcileComposerCursor) so no reverse box sits over the placeholder.
+	m.reconcileComposerCursor()
 	m.loadAgents()
 	m.loadSkills()
 	m.conv = newConvView(1)
@@ -201,12 +243,17 @@ func New(providers map[string]*harness.Provider, current, theme, userID, session
 	return m, nil
 }
 
-// Init starts the cursor blink and the status spinner.
+// Init starts the cursor blink, the status spinner and the async load of the
+// recent-session list (for the right rail and /sessions).
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		textarea.Blink,
 		tea.Tick(spinnerInterval, func(time.Time) tea.Msg { return spinnerTickMsg{} }),
-	)
+	}
+	if cmd := m.loadSessions(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 // Update dispatches messages.
@@ -228,8 +275,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinnerTickMsg:
 		m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
 		if m.streaming || m.compressing {
-			if m.compressing {
-				// Animate the in-conversation compression indicator too.
+			if m.compressing || (m.streaming && m.generationPending) {
+				// Animate in-conversation indicators: the compression
+				// progress, and the live "Thinking" placeholder while we wait
+				// for the first deltas of a model generation.
 				m.updateViewport()
 			}
 			return m, tea.Tick(spinnerInterval, func(time.Time) tea.Msg { return spinnerTickMsg{} })
@@ -241,6 +290,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case compressMsg:
 		return m.handleCompressResult(msg)
+
+	case sessionsMsg:
+		return m.handleSessions(msg)
 
 	case tea.KeyMsg:
 		if m.stats != nil {
@@ -316,6 +368,17 @@ func (m Model) handleADK(msg adkEventMsg) (tea.Model, tea.Cmd) {
 	m.rendered = append(m.rendered, m.renderEvent(ev))
 	m.trackUsage(ev)
 
+	// Track whether a model generation is still pending so the live
+	// "Thinking" slot appears at the right times across the tool loop: every
+	// tool result is followed by another model call; a model output or a tool
+	// request ends the current generation.
+	switch {
+	case hasFunctionResponse(ev.Content):
+		m.generationPending = true
+	case hasFunctionCall(ev.Content), ev.Content.Role == string(genai.RoleModel):
+		m.generationPending = false
+	}
+
 	if isConfirmationRequest(ev) {
 		m.enterConfirmation(ev)
 	}
@@ -381,6 +444,117 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Right session rail focus (tab cycles into it): arrows move the selection,
+	// enter resumes it, esc/tab hand focus back to the composer, any other key
+	// exits the rail and is processed normally below.
+	if m.railFocused && m.railActive() {
+		switch msg.String() {
+		case "up":
+			m.moveSessionsSel(-1)
+			m.updateViewport()
+			return m, nil
+		case "down":
+			m.moveSessionsSel(+1)
+			m.updateViewport()
+			return m, nil
+		case "home", "pgup":
+			m.sessionsSel = 0
+			m.updateViewport()
+			return m, nil
+		case "end", "pgdown":
+			if n := len(m.sessionEntries()); n > 0 {
+				m.sessionsSel = n - 1
+			}
+			m.updateViewport()
+			return m, nil
+		case "enter":
+			return m.resumeSelectedSession()
+		case "tab", "esc":
+			m.exitRailFocus()
+			return m, nil
+		case "ctrl+c":
+			return m, tea.Quit
+		case "ctrl+t":
+			return m.toggleThinking()
+		default:
+			// Typing hands focus back to the composer; the key is processed
+			// by the normal idle path below.
+			m.exitRailFocus()
+		}
+	}
+
+	// /sessions picker (open via the /sessions command): arrows move the
+	// selection, enter resumes it, esc dismisses it, and any other key closes
+	// the picker and edits the composer.
+	if m.sessionsOpen() {
+		switch msg.String() {
+		case "up":
+			m.moveSessionsSel(-1)
+			m.updateViewport()
+			return m, nil
+		case "down":
+			m.moveSessionsSel(+1)
+			m.updateViewport()
+			return m, nil
+		case "home", "pgup":
+			m.sessionsSel = 0
+			m.updateViewport()
+			return m, nil
+		case "end", "pgdown":
+			if n := len(m.sessionEntries()); n > 0 {
+				m.sessionsSel = n - 1
+			}
+			m.updateViewport()
+			return m, nil
+		case "enter":
+			return m.resumeSelectedSession()
+		case "tab":
+			if m.railActive() {
+				// Move the picker into the rail's list (desktop terminals).
+				m.sessionsShow = false
+				return m.enterRailFocus()
+			}
+			m.sessionsShow = false
+			m.updateViewport()
+			return m, nil
+		case "esc":
+			m.sessionsShow = false
+			m.updateViewport()
+			return m, nil
+		case "ctrl+c":
+			return m, tea.Quit
+		default:
+			// Typing dismisses the picker and edits the composer.
+			m.sessionsShow = false
+		}
+	}
+
+	// Slash-command palette ("/" at the start of the composer): arrows move
+	// the selection, tab/enter complete the highlighted command, esc dismisses
+	// the list (the typed text is kept). Other keys fall through to editing.
+	if m.paletteVisible() {
+		switch msg.String() {
+		case "up":
+			n := len(m.paletteRows())
+			m.paletteSel = (m.paletteSel - 1 + n) % n
+			m.updateViewport()
+			return m, nil
+		case "down":
+			n := len(m.paletteRows())
+			m.paletteSel = (m.paletteSel + 1) % n
+			m.updateViewport()
+			return m, nil
+		case "tab", "enter":
+			return m.paletteComplete()
+		case "esc":
+			m.paletteShow = false
+			m.updateViewport()
+			return m, nil
+		case "ctrl+c":
+			return m, tea.Quit
+		}
+	}
+
 	// Scrollback stays available after streaming. Page keys always scroll;
 	// arrows scroll too when there is overflow, otherwise they edit the
 	// composer.
@@ -402,15 +576,33 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.send()
 	case "ctrl+j":
 		m.textarea.InsertString("\n")
-		return m, nil
+		return m, m.reconcileComposerCursor()
 	case "ctrl+t":
 		return m.toggleThinking()
+	case "tab":
+		// Tab cycles focus to the right session rail when there is something
+		// to resume (desktop terminals only — the rail is inactive on narrow
+		// ones like the Pi's 118 columns).
+		if m.railActive() && len(m.sessionEntries()) > 0 {
+			return m.enterRailFocus()
+		}
+		return m, nil
 	case "esc":
 		return m, nil
 	default:
+		prev := m.textarea.Value()
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
-		return m, cmd
+		// Edits re-arm the slash palette (esc dismisses it until the next
+		// edit) and keep its filtered list/selection live — it renders in the
+		// conversation live slot, so the list needs refreshing per keystroke.
+		if !m.streaming && !m.confirming && !m.compressing &&
+			(strings.HasPrefix(prev, "/") || strings.HasPrefix(m.textarea.Value(), "/")) {
+			m.paletteShow = true
+			m.clampPalette()
+			m.updateViewport()
+		}
+		return m, batchCmds(cmd, m.reconcileComposerCursor())
 	}
 }
 
@@ -421,9 +613,10 @@ func (m Model) send() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.textarea.Reset()
+	m.reconcileComposerCursor() // empty again: drop the block cursor
 	m.ephemeral = nil
 	if strings.HasPrefix(text, "/") {
-		return m.handleCommand(text)
+		return dispatchCommand(m, text)
 	}
 	content := genai.NewContentFromText(text, genai.RoleUser)
 	// Auto-compress behind the scenes when the context is already at/over the
@@ -450,6 +643,7 @@ func (m Model) startStream(content *genai.Content) (tea.Model, tea.Cmd) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.streaming = true
+	m.generationPending = true // a new model generation is expected
 	m.cancelled = false
 	m.streamFailed = false
 	m.ctxUsageThisRun = false
@@ -575,6 +769,9 @@ func (m *Model) flushStream() {
 	}
 	m.assistantActive = true
 	if content != "" {
+		// Visible text has started: the thinking phase is over (any streamed
+		// thoughts freeze as a stable block above the response).
+		m.generationPending = false
 		m.assistantChunks.append(m.md, content)
 		m.assistantChunks.render(m.md)
 	}
@@ -597,13 +794,17 @@ func (m *Model) flushStream() {
 // user's y/n.
 func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 	m.streaming = false
+	m.generationPending = false
 	m.cancel = nil
 	m.adkCh = nil
 	m.streamBuffer.Reset()
 	m.thinkingBuffer.Reset()
+	// A turn persisted events to the current session: refresh the rail/picker
+	// list so its preview, order and timestamps stay current.
+	refresh := m.loadSessions()
 	if m.confirming {
 		m.updateViewport()
-		return m, nil
+		return m, refresh
 	}
 	if !m.cancelled && !m.streamFailed {
 		// Normal completion: the final event was already rendered once by
@@ -627,9 +828,10 @@ func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 	// them), not only when the user types the next prompt.
 	if m.autoCompress && !m.cancelled && !m.streamFailed &&
 		m.ctxEst >= m.thresholdTokens() && len(m.events) >= m.ctxNoAutoAfter {
-		return m.startCompression(true, "", nil, "")
+		mm, cmd := m.startCompression(true, "", nil, "")
+		return mm, batchCmds(refresh, cmd)
 	}
-	return m, nil
+	return m, refresh
 }
 
 // --- HITL confirmation ----------------------------------------------------
@@ -693,44 +895,6 @@ func (m *Model) cancelStream() {
 	if m.cancel != nil {
 		m.cancel()
 	}
-}
-
-// handleCommand processes slash commands.
-func (m Model) handleCommand(line string) (tea.Model, tea.Cmd) {
-	fields := strings.Fields(line)
-	cmd := fields[0]
-	switch cmd {
-	case "/help":
-		m.addInfo(helpText)
-	case "/quit":
-		return m, tea.Quit
-	case "/new":
-		return m.newSession()
-	case "/model":
-		if len(fields) < 2 {
-			m.addInfo(fmt.Sprintf("Current: **%s** (%s).\n\nProviders: %s.",
-				m.current, m.providers[m.current].Model, providerNames(m.providers)))
-			return m, nil
-		}
-		return m.switchProvider(fields[1])
-	case "/notes":
-		return m.handleNotes(fields[1:])
-	case "/agents":
-		return m.handleAgents(fields[1:])
-	case "/skills":
-		return m.handleSkills(fields[1:])
-	case "/tools":
-		return m.handleTools(fields[1:])
-	case "/compress", "/compact":
-		if m.streaming || m.confirming {
-			m.err = "wait for the current response before compressing context"
-			return m, nil
-		}
-		return m.startCompression(false, strings.Join(fields[1:], " "), nil, "")
-	default:
-		m.err = fmt.Sprintf("unknown command %q — type /help", cmd)
-	}
-	return m, nil
 }
 
 func (m Model) handleAgents(args []string) (tea.Model, tea.Cmd) {
@@ -907,16 +1071,20 @@ func (m Model) newSession() (tea.Model, tea.Cmd) {
 	m.assistantThinking.reset()
 	m.thinkingBlock = ""
 	m.thinkingFrozen = false
+	m.generationPending = false
 	m.summaryEventID = ""
 	m.ctxEst = 0
 	m.ctxLastPrompt = 0
 	m.ctxNoAutoAfter = 0
 	m.ctxUsageThisRun = false
 	m.compressIsAuto = false
+	// The picker and rail focus describe the previous session; close them.
+	m.sessionsShow = false
+	m.railFocused = false
 	m.resetView()
 	m.status = "new session started"
 	m.updateViewport()
-	return m, nil
+	return m, m.loadSessions()
 }
 
 func (m Model) switchProvider(arg string) (tea.Model, tea.Cmd) {
@@ -1189,7 +1357,18 @@ func assistantChunkBoundary(s string, cap int) int {
 	return -1
 }
 
+// renderEvent renders one completed display event, followed by a trailing
+// blank line so consecutive messages breathe (the blank line carries no rail —
+// see convView.view).
 func (m *Model) renderEvent(ev *session.Event) string {
+	s := m.renderEventInner(ev)
+	if s == "" {
+		return ""
+	}
+	return s + "\n"
+}
+
+func (m *Model) renderEventInner(ev *session.Event) string {
 	if ev.Content == nil {
 		return ""
 	}
@@ -1257,14 +1436,16 @@ func thoughtOf(c *genai.Content) string {
 	return b.String()
 }
 
-// renderUser renders a user message.
+// renderUser renders a user message: a "You" label plus the text. The
+// conversation view paints the whole message with a blue left rail.
 func (m *Model) renderUser(text string) string {
-	body := ui.userBody.Width(maxInt(m.width-6, 20)).Render(text)
+	body := ui.userBody.Width(maxInt(m.contentWidth()-4, 20)).Render(text)
 	return ui.userLabel.Render("You") + "\n" + body
 }
 
 // renderAssistant renders an assistant reply, optionally prefixed by a
-// collapsible thinking block (hidden behind a header unless showThinking is on).
+// collapsible thinking block (hidden behind a header unless showThinking is
+// on). The conversation view paints the message with a rose left rail.
 func (m *Model) renderAssistant(md, thinking string) string {
 	body, err := m.md.Render(md)
 	if err != nil {
@@ -1279,21 +1460,22 @@ func (m *Model) renderAssistant(md, thinking string) string {
 // renderThinking renders a model thinking block: a dimmed header plus, when
 // shown, the reasoning text indented underneath. Hidden by default.
 func (m *Model) renderThinking(thinking string) string {
-	header := "▶ thinking — ctrl+t to show"
+	header := "Thinking"
 	if m.showThinking {
-		header = "▼ thinking"
+		header = "▼ Thinking"
 	}
 	var sb strings.Builder
 	sb.WriteString(ui.thinkingHeader.Render(header))
 	if m.showThinking {
 		sb.WriteString("\n")
-		sb.WriteString(ui.thinkingBody.Width(maxInt(m.width-6, 20)).Render(thinking))
+		sb.WriteString(ui.thinkingBody.Width(maxInt(m.contentWidth()-4, 20)).Render(thinking))
 	}
 	return sb.String()
 }
 
 // renderFunctionCall renders a model function-call event (a tool request) as
-// a tool block. Pending confirmation wrappers render as a waiting marker.
+// a compact dim internal block (no rail). Pending confirmation wrappers
+// render as an actionable waiting marker instead.
 func (m *Model) renderFunctionCall(c *genai.Content) string {
 	var sb strings.Builder
 	for _, p := range c.Parts {
@@ -1302,22 +1484,23 @@ func (m *Model) renderFunctionCall(c *genai.Content) string {
 		}
 		fc := p.FunctionCall
 		if fc.Name == toolconfirmation.FunctionCallName {
-			sb.WriteString("**⏳ Awaiting your approval**\n\n")
+			sb.WriteString(ui.confirm.Render("⏳ awaiting your approval"))
+			sb.WriteString("\n")
 			continue
 		}
-		sb.WriteString("**Tool call**\n\n")
-		fmt.Fprintf(&sb, "- tool: `%s`\n", fc.Name)
+		sb.WriteString(ui.toolHeader.Render("⚙ " + fc.Name))
 		if len(fc.Args) > 0 {
-			sb.WriteString("- args:\n")
-			for k, v := range fc.Args {
-				fmt.Fprintf(&sb, "  - `%s`: `%v`\n", k, v)
-			}
+			sb.WriteString("\n")
+			sb.WriteString(ui.toolBody.Render(clipDisplay(formatJSON(fc.Args), maxInt(m.contentWidth()-8, 40), toolDisplayChars)))
 		}
+		sb.WriteString("\n")
 	}
-	return m.renderMD(sb.String())
+	return strings.TrimRight(sb.String(), "\n")
 }
 
-// renderFunctionResponse renders a tool-result event.
+// renderFunctionResponse renders a tool-result event as a compact dim
+// internal block (no rail). The body is clipped for display — the model saw
+// the full output.
 func (m *Model) renderFunctionResponse(c *genai.Content) string {
 	var sb strings.Builder
 	for _, p := range c.Parts {
@@ -1325,19 +1508,49 @@ func (m *Model) renderFunctionResponse(c *genai.Content) string {
 			continue
 		}
 		fr := p.FunctionResponse
-		sb.WriteString("**Tool result**\n\n")
-		fmt.Fprintf(&sb, "- tool: `%s`\n", fr.Name)
-		if len(fr.Response) > 0 {
-			if out, ok := fr.Response["output"]; ok {
-				fmt.Fprintf(&sb, "\n```text\n%v\n```", out)
-			} else if errStr, ok := fr.Response["error"]; ok {
-				fmt.Fprintf(&sb, "\n**Error**\n\n```text\n%v\n```", errStr)
-			} else {
-				fmt.Fprintf(&sb, "\n```json\n%s\n```", formatJSON(fr.Response))
-			}
+		sb.WriteString(ui.toolHeader.Render("↳ " + fr.Name))
+		body := ""
+		if out, ok := fr.Response["output"]; ok {
+			body = fmt.Sprintf("%v", out)
+		} else if errStr, ok := fr.Response["error"]; ok {
+			body = "error: " + fmt.Sprintf("%v", errStr)
+		} else {
+			body = formatJSON(fr.Response)
+		}
+		if body != "" {
+			sb.WriteString("\n")
+			sb.WriteString(ui.toolBody.Render(clipDisplay(body, maxInt(m.contentWidth()-8, 40), toolDisplayChars)))
+		}
+		sb.WriteString("\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// toolDisplayChars caps a tool block's body in the conversation view (huge
+// results stay visible in the transcript and to the model, but don't flood
+// the display).
+const toolDisplayChars = 6000
+
+// clipDisplay truncates a block to at most totalMax runes and each line to
+// lineMax runes, so dim internal tool blocks never overflow the terminal.
+func clipDisplay(s string, lineMax, totalMax int) string {
+	body := clipRunes(s, totalMax)
+	lines := strings.Split(body, "\n")
+	for i, l := range lines {
+		if r := []rune(l); len(r) > lineMax {
+			lines[i] = string(r[:lineMax]) + "…"
 		}
 	}
-	return m.renderMD(sb.String())
+	return strings.Join(lines, "\n")
+}
+
+// clipRunes truncates s to at most n runes (append "…" when cut).
+func clipRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func (m *Model) renderMD(md string) string {
@@ -1375,22 +1588,67 @@ func (m *Model) refresh() {
 	m.updateViewport()
 }
 
+// zoneForEvent returns the rail zone for a completed display event: user
+// messages and assistant replies get rails; tool calls/results, summaries and
+// anything else are plain (internal, dim).
+func (m *Model) zoneForEvent(ev *session.Event) lineZone {
+	if ev == nil || ev.Content == nil {
+		return zonePlain
+	}
+	if ev.ID != "" && ev.ID == m.summaryEventID {
+		return zonePlain
+	}
+	switch {
+	case hasFunctionCall(ev.Content), hasFunctionResponse(ev.Content):
+		return zonePlain
+	case ev.Content.Role == string(genai.RoleUser):
+		return zoneUser
+	default:
+		return zoneAssistant
+	}
+}
+
 // stableParts lists every piece of completed (frozen) content in display
-// order: completed events, the frozen thinking block (if any), finalized
-// streaming chunks, and ephemeral blocks.
-func (m *Model) stableParts() []string {
+// order with its zone: completed events, the frozen thinking block (if any),
+// finalized streaming chunks, and ephemeral blocks.
+func (m *Model) stableParts() []taggedPart {
 	n := len(m.rendered) + len(m.ephemeral) + len(m.assistantChunks.chunks)
 	if m.thinkingBlock != "" {
 		n++
 	}
-	parts := make([]string, 0, n)
-	parts = append(parts, m.rendered...)
-	if m.thinkingBlock != "" {
-		parts = append(parts, m.thinkingBlock)
+	parts := make([]taggedPart, 0, n)
+	for i, r := range m.rendered {
+		var ev *session.Event
+		if i < len(m.events) {
+			ev = m.events[i]
+		}
+		parts = append(parts, taggedPart{text: r, zone: m.zoneForEvent(ev)})
 	}
-	parts = append(parts, m.assistantChunks.chunks...)
-	parts = append(parts, m.ephemeral...)
+	if m.thinkingBlock != "" {
+		parts = append(parts, taggedPart{text: m.thinkingBlock, zone: zoneAssistant})
+	}
+	for _, c := range m.assistantChunks.chunks {
+		parts = append(parts, taggedPart{text: c, zone: zoneAssistant})
+	}
+	for _, e := range m.ephemeral {
+		parts = append(parts, taggedPart{text: e, zone: zonePlain})
+	}
 	return parts
+}
+
+// thinkingIndicator renders the live in-conversation "Thinking" slot shown
+// while a model generation is pending: the real thinking block once thoughts
+// are streaming, otherwise an animated placeholder right under the last
+// content. ctrl+t expands it (showThinking) to stream the thoughts live.
+func (m *Model) thinkingIndicator() string {
+	if m.assistantThinking != nil && m.assistantThinking.raw.Len() > 0 {
+		return m.renderThinkingBlock()
+	}
+	title := "Thinking"
+	if m.showThinking {
+		title = "▼ Thinking"
+	}
+	return ui.thinkingHeader.Render(title + " " + spinnerFrames[m.spinnerIdx] + "…")
 }
 
 // renderThinkingBlock renders the streamed thinking (a dimmed header plus,
@@ -1400,9 +1658,9 @@ func (m *Model) renderThinkingBlock() string {
 	if m.assistantThinking == nil || m.assistantThinking.raw.Len() == 0 {
 		return ""
 	}
-	header := "▶ thinking — ctrl+t to show"
+	header := "Thinking"
 	if m.showThinking {
-		header = "▼ thinking"
+		header = "▼ Thinking"
 	}
 	var sb strings.Builder
 	sb.WriteString(ui.thinkingHeader.Render(header))
@@ -1451,7 +1709,8 @@ func (m *Model) resetView() {
 // updateViewport keeps the line viewer in sync with the model. Completed
 // content is appended once (O(delta)); the live streaming tail is replaced in
 // place each tick (O(tail)). This replaced bubbles/viewport.SetContent, which
-// re-split the whole conversation on every 50ms tick.
+// re-split the whole conversation on every 50ms tick. The live slot also
+// carries the slash-command palette when it is open (idle only).
 func (m *Model) updateViewport() {
 	if m.stats != nil {
 		start := time.Now()
@@ -1464,14 +1723,24 @@ func (m *Model) updateViewport() {
 		m.conv.reset()
 	}
 	for i := m.viewCommitted; i < len(stable); i++ {
-		m.conv.appendStable(stable[i]) // O(delta): only new parts are appended
+		m.conv.appendStableZ(stable[i].text, stable[i].zone) // O(delta): only new parts are appended
 	}
 	m.viewCommitted = len(stable)
-	if m.compressing {
+	switch {
+	case m.compressing:
 		m.conv.setLive(m.compressionIndicator())
-	} else if m.assistantActive {
-		m.conv.setLive(m.streamTail())
-	} else {
+	case m.streaming && m.generationPending:
+		// A model generation is pending: show the live in-conversation
+		// "Thinking" slot under the last content (opencode/openrouter style).
+		m.conv.setLiveZ(m.thinkingIndicator(), zoneAssistant)
+	case m.assistantActive:
+		m.conv.setLiveZ(m.streamTail(), zoneAssistant)
+	case m.sessionsOpen():
+		// /sessions picker: the recent-session list in the live slot.
+		m.conv.setLive(m.sessionsBlock())
+	case m.paletteVisible():
+		m.conv.setLive(m.paletteBlock())
+	default:
 		m.conv.clearLive()
 	}
 	// setLive/clamp keep the user's scroll position; when at the bottom
@@ -1498,7 +1767,9 @@ func (m *Model) scroll(k string) {
 }
 
 func (m *Model) rebuildRenderer() {
-	md, err := newMarkdownRenderer(maxInt(m.width-4, 40), m.theme)
+	// Wrap at the content width (terminal width minus the right rail when it
+	// is active) so markdown lines never run underneath the rail column.
+	md, err := newMarkdownRenderer(maxInt(m.contentWidth()-4, 40), m.theme)
 	if err != nil {
 		return
 	}
@@ -1507,30 +1778,45 @@ func (m *Model) rebuildRenderer() {
 
 func (m *Model) layout() {
 	const (
-		headerH   = 1
 		statusH   = 1
-		composerH = 3
+		composerH = 4 // panel: 1 top + 1 bottom padding + 2 textarea rows
 	)
-	vpH := maxInt(m.height-headerH-composerH-statusH, 1)
+	contentW := m.contentWidth()
+	vpH := maxInt(m.height-statusH-composerH, 1)
 	m.conv.height = vpH
-	m.textarea.SetWidth(maxInt(m.width-6, 20))
-	m.textarea.SetHeight(composerH - 1)
+	m.textarea.SetWidth(maxInt(contentW-8, 20))
+	m.textarea.SetHeight(composerH - 2)
+}
+
+// contentWidth returns the width available for content (the full terminal
+// width minus the right session rail when it is active — see railActive).
+func (m Model) contentWidth() int {
+	if m.railActive() {
+		return maxInt(m.width-m.railWidth(), 40)
+	}
+	return m.width
 }
 
 // View composes the screen. Bubble Tea calls this after every message, so it
 // is a hot path worth measuring with GARESS_STATS=1.
 func (m Model) View() string {
 	if m.stats == nil {
-		return strings.Join([]string{m.header(), m.conv.view(), m.composer(), m.statusLine()}, "\n")
+		return m.frame()
 	}
 	start := time.Now()
 	defer func() { m.stats.add(statView, time.Since(start)) }()
 	// Per-component timing (tui-stats-view) — on a slow CPU this shows whether
 	// View() is dominated by the composer, the conversation join, etc.
+	if m.hero() {
+		t0 := time.Now()
+		hero := m.heroBlock()
+		m.stats.addViewPart(viewPartConv, time.Since(t0))
+		t0 = time.Now()
+		st := m.statusLine()
+		m.stats.addViewPart(viewPartStatus, time.Since(t0))
+		return m.wrapFrame(strings.Join([]string{hero, st}, "\n"))
+	}
 	t0 := time.Now()
-	hdr := m.header()
-	m.stats.addViewPart(viewPartHeader, time.Since(t0))
-	t0 = time.Now()
 	cv := m.conv.view()
 	m.stats.addViewPart(viewPartConv, time.Since(t0))
 	t0 = time.Now()
@@ -1539,60 +1825,426 @@ func (m Model) View() string {
 	t0 = time.Now()
 	st := m.statusLine()
 	m.stats.addViewPart(viewPartStatus, time.Since(t0))
-	// Left-aligned frame stack. Do NOT use lipgloss.JoinVertical here: it
-	// splits every block, re-measures the ANSI display width of EVERY line
-	// and re-pads the whole frame to a common width on every call — O(frame)
-	// per keystroke (~580µs of the ~600µs View on a desktop; ~90ms/frame on a
-	// Pi 1 per GARESS_STATS, scaling with conversation size). Nothing in this
-	// layout needs a shared width (all blocks are left-aligned and the
-	// terminal erases to end-of-line when lines are repainted), so trailing
-	// padding is invisible. strings.Join reproduces JoinVertical's line
-	// structure exactly (an empty block still contributes one blank line,
-	// matching strings.Split("", "\n")) without any width math.
-	return strings.Join([]string{hdr, cv, comp, st}, "\n")
+	return m.wrapFrame(m.joinFrame(cv, comp, st))
 }
 
-func (m Model) header() string {
-	prov := m.providers[m.current]
-	model := ""
-	if prov != nil {
-		model = prov.Model
+// frame is the non-instrumented View() path.
+func (m Model) frame() string {
+	if m.hero() {
+		return m.wrapFrame(strings.Join([]string{m.heroBlock(), m.statusLine()}, "\n"))
 	}
-	return ui.header.Render(fmt.Sprintf(" garess · %s · %s ", m.current, model))
+	return m.wrapFrame(m.joinFrame(m.conv.view(), m.composer(), m.statusLine()))
 }
 
+// joinFrame stacks the conversation, composer and status sections. Left-
+// aligned frame stack. Do NOT use lipgloss.JoinVertical here: it splits every
+// block, re-measures the ANSI display width of EVERY line and re-pads the
+// whole frame to a common width on every call — O(frame) per keystroke
+// (~580µs of the ~600µs View on a desktop; ~90ms/frame on a Pi 1 per
+// GARESS_STATS, scaling with conversation size). Nothing in this layout needs
+// a shared width (all blocks are left-aligned and the terminal erases to
+// end-of-line when lines are repainted), so trailing padding is invisible.
+// strings.Join reproduces JoinVertical's line structure exactly (an empty
+// block still contributes one blank line, matching strings.Split("", "\n"))
+// without any width math.
+func (m Model) joinFrame(cv, comp, st string) string {
+	return strings.Join([]string{cv, comp, st}, "\n")
+}
+
+// composer renders the editor panel for the conversation view: the textarea
+// inside a full-width panel with a slightly lighter background and the user
+// left rail (same as user messages).
 func (m Model) composer() string {
-	return ui.composer.Render(m.textarea.View())
+	return m.editorBox(m.contentWidth())
 }
 
-func (m Model) statusLine() string {
-	var parts []string
-	if m.confirming {
-		parts = append(parts, ui.confirm.Render("⚠ "+m.confirmPrompt+"  (y approve · n deny)"))
-	} else if m.streaming {
-		parts = append(parts, ui.streaming.Render(spinnerFrames[m.spinnerIdx]+" thinking…  (esc to stop)"))
+// editorBox wraps the textarea view in the editor panel style, stretched to
+// the given width so the panel background spans the whole row. Width is
+// applied per call (the model is value-copied); the panel is a small fixed
+// block, so the one-time lipgloss width pass is bounded and cheap.
+func (m Model) editorBox(w int) string {
+	if w <= 0 {
+		return ui.composer.Render(m.composerBody())
 	}
-	if m.err != "" {
-		parts = append(parts, ui.err.Render("⚠ "+m.err))
+	// The prompt box wears the same left rail as user messages ("You"): the
+	// rail prefix occupies the composerRail cells, so the panel renders at
+	// w-composerInner and every row is prefixed with the rail (painted over
+	// the panel background). Typed text keeps its column because the panel's
+	// own left padding is gone.
+	inner := maxInt(w-ui.composerInner, 20)
+	panel := ui.composer.Width(inner).Render(m.composerBody())
+	lines := strings.Split(panel, "\n")
+	for i, l := range lines {
+		lines[i] = ui.composerRail + l
 	}
-	if m.status != "" {
-		parts = append(parts, ui.status.Render(m.status))
+	return strings.Join(lines, "\n")
+}
+
+// composerBody is the content rendered inside the editor panel: the live
+// textarea view once there is text; otherwise the placeholder is drawn here
+// directly. bubbles' own placeholder rendering leaves its internal viewport
+// padding without a background, which shows as a black band to the right of
+// the placeholder text (the panel background can't repaint those cells — the
+// viewport output carries its own style resets). These hand-drawn rows carry
+// the panel background end to end, so the empty composer is uniform.
+func (m Model) composerBody() string {
+	if m.textarea.Value() != "" {
+		return m.textarea.View()
 	}
-	parts = append(parts, ui.status.Render("enter send · ctrl+j newline · /help · ctrl+c quit"))
-	line := lipgloss.JoinHorizontal(lipgloss.Left, parts...)
-	// Context usage is always visible, right-aligned on the status line.
-	if r := m.contextReadout(); r != "" {
-		seg := ui.info.Render(r)
-		if m.width > 0 {
-			if pad := m.width - lipgloss.Width(line) - lipgloss.Width(seg) - 1; pad > 0 {
-				line += strings.Repeat(" ", pad)
-			}
-		} else {
-			line += "  "
+	// Two content rows, matching the textarea's height: the placeholder text
+	// and a blank row. Both are drawn with the panel background (the panel
+	// stretches them to the full width).
+	return ui.placeholderBody.Render(m.textarea.Placeholder) + "\n" +
+		ui.placeholderBody.Render(" ")
+}
+
+// styleTextarea makes the composer textarea blend into the editor panel. The
+// placeholder is a dim foreground and no cursor-line block background is
+// painted. Crucially, the PANEL background is baked into every textarea
+// content style: the textarea emits style resets around its typed text, and
+// those would otherwise drop the typed rows back onto the terminal's default
+// (darker) background instead of the panel's.
+func styleTextarea(ta *textarea.Model, theme string) {
+	c := darkColors
+	if theme == "light" {
+		c = lightColors
+	}
+	panelBG := lipgloss.Color(c.panelBG)
+	focused, blurred := textarea.DefaultStyles()
+	ph := lipgloss.NewStyle().Foreground(lipgloss.Color(c.faint)).Background(panelBG)
+	lineBG := lipgloss.NewStyle().Background(panelBG)
+	focused.Text = focused.Text.Background(panelBG)
+	focused.Prompt = focused.Prompt.Background(panelBG)
+	focused.Placeholder = ph
+	focused.CursorLine = lineBG
+	focused.EndOfBuffer = focused.EndOfBuffer.Background(panelBG)
+	blurred.Text = blurred.Text.Background(panelBG)
+	blurred.Prompt = blurred.Prompt.Background(panelBG)
+	blurred.Placeholder = ph
+	blurred.CursorLine = lineBG
+	blurred.EndOfBuffer = blurred.EndOfBuffer.Background(panelBG)
+	ta.FocusedStyle = focused
+	ta.BlurredStyle = blurred
+}
+
+// reconcileComposerCursor matches the textarea's cursor to the composer
+// state. While the composer is EMPTY the block cursor is hidden: bubbles
+// renders that cursor OVER the first placeholder character, and its
+// reverse-video box reads as a black block next to the placeholder text. As
+// soon as there is text the blinking block cursor returns (SetMode(CursorBlink)
+// flips it visible and returns the command that (re)starts the blink cycle).
+func (m *Model) reconcileComposerCursor() tea.Cmd {
+	c := &m.textarea.Cursor
+	if m.textarea.Value() == "" {
+		if c.Mode() != cursor.CursorHide {
+			c.SetMode(cursor.CursorHide)
 		}
-		line += seg
+		return nil
 	}
-	return line
+	if c.Mode() != cursor.CursorBlink {
+		return c.SetMode(cursor.CursorBlink)
+	}
+	return nil
+}
+
+// modelLabel is the "provider · model" text for the bottom bar.
+func (m Model) modelLabel() string {
+	prov := m.providers[m.current]
+	if prov == nil {
+		return m.current
+	}
+	return m.current + " · " + prov.Model
+}
+
+// statusLine renders the bottom bar: the busy state / error / provider·model
+// on the left, context usage and the app version right-aligned.
+func (m Model) statusLine() string {
+	var line string
+	switch {
+	case m.confirming:
+		line = ui.confirm.Render("⚠ " + m.confirmPrompt + "  (y approve · n deny)")
+	case m.streaming:
+		line = ui.streaming.Render(spinnerFrames[m.spinnerIdx] + " " + m.streamVerb() + "  (esc to stop)")
+	case m.err != "":
+		line = ui.err.Render("⚠ " + m.err)
+	case m.status != "":
+		line = ui.status.Render(m.status)
+	default:
+		line = ui.meta.Render(m.modelLabel())
+	}
+	// Context usage is always visible, right-aligned on the status line.
+	var right []string
+	if r := m.contextReadout(); r != "" {
+		right = append(right, ui.info.Render(r))
+	}
+	if m.version != "" {
+		right = append(right, ui.status.Render(m.version))
+	}
+	if len(right) == 0 {
+		return line
+	}
+	seg := strings.Join(right, "  ")
+	if m.width > 0 {
+		if pad := m.contentWidth() - lipgloss.Width(line) - lipgloss.Width(seg) - 1; pad > 0 {
+			line += strings.Repeat(" ", pad)
+		}
+	} else {
+		line += "  "
+	}
+	return line + seg
+}
+
+// streamVerb labels the streaming phase on the bottom bar: thinking while a
+// model generation is pending, responding once visible text streams, and a
+// generic working state while tools run between generations.
+func (m Model) streamVerb() string {
+	switch {
+	case m.generationPending:
+		return "thinking…"
+	case m.assistantActive:
+		return "responding…"
+	default:
+		return "working…"
+	}
+}
+
+// --- right session rail (Phase E) ----------------------------------------
+
+// railMinWidth is the terminal width at which the right session rail appears.
+// Below it (e.g. the Pi's 118 columns) the rail is absent entirely, so its
+// per-frame width math never runs on the Pi.
+const railMinWidth = 140
+
+// railWidth is the width reserved for the right session rail.
+const railWidth = 34
+
+// railActive reports whether the right session rail is drawn: it needs a wide
+// enough terminal (desktop — never on the Pi's 118 columns) AND a session
+// service to list. The rail's per-frame width math only runs while active.
+func (m Model) railActive() bool {
+	return m.width >= railMinWidth && m.sessionSvc != nil
+}
+
+// railWidth returns the reserved rail width (only meaningful when railActive).
+func (m Model) railWidth() int { return railWidth }
+
+// --- hero (empty-state launch screen) ------------------------------------
+
+const (
+	heroTagline = "minimal AI harness for the terminal"
+	heroHint    = "enter send · ctrl+j newline · type / for commands · ctrl+t thinking"
+)
+
+// hero reports whether the empty-state launch screen is showing: no
+// conversation content and nothing busy in flight.
+func (m Model) hero() bool {
+	return len(m.rendered) == 0 && len(m.ephemeral) == 0 &&
+		!m.assistantActive && !m.streaming && !m.compressing && !m.confirming
+}
+
+// heroBlock renders the launch screen — pixel logo, tagline, slash palette
+// (when open), the editor panel and a hint line, vertically centered on the
+// terminal's own (dark) background. It returns exactly the rows above the
+// bottom status bar.
+func (m Model) heroBlock() string {
+	if m.height <= 1 {
+		return "" // no rows yet (before the first window size); bubble tea re-renders on resize
+	}
+	avail := m.height - 1
+	// Center within the content column (the right rail occupies the rest when
+	// it is active, so the hero never runs under it).
+	width := m.contentWidth()
+	if width <= 0 {
+		width = 100
+	}
+	contentW := min(maxInt(width-8, 40), 110)
+	leftPad := maxInt((width-contentW)/2, 0)
+
+	center := func(s string) string {
+		pad := maxInt((width-lipgloss.Width(s))/2, 0)
+		return strings.Repeat(" ", pad) + s
+	}
+
+	var content []string
+	if width >= logoWidth() {
+		for _, l := range logoLines() {
+			content = append(content, center(ui.logo.Render(l)))
+		}
+		content = append(content, "")
+	}
+	content = append(content, center(ui.tagline.Render(heroTagline)))
+	content = append(content, "")
+
+	if m.paletteVisible() {
+		for _, r := range m.paletteList(paletteMaxRows, contentW) {
+			content = append(content, center(r))
+		}
+		content = append(content, "")
+	}
+	padLine := strings.Repeat(" ", leftPad)
+	if m.sessionsOpen() {
+		for _, r := range m.sessionsRows(6, contentW) {
+			content = append(content, padLine+r)
+		}
+		content = append(content, "")
+	}
+	for _, l := range strings.Split(strings.TrimSuffix(m.editorBox(contentW), "\n"), "\n") {
+		content = append(content, padLine+l)
+	}
+	content = append(content, "")
+	content = append(content, center(ui.hint.Render(heroHint)))
+
+	// Never let the block overflow the screen: drop least-important top rows
+	// (logo, tagline, palette) first, then the hint, keeping the editor.
+	for len(content) > avail && len(content) > 6 {
+		content = content[1:]
+	}
+	for len(content) > avail {
+		content = content[:len(content)-1]
+	}
+	out := make([]string, 0, avail)
+	for i := 0; i < (avail-len(content))/2; i++ {
+		out = append(out, "")
+	}
+	out = append(out, content...)
+	for len(out) < avail {
+		out = append(out, "")
+	}
+	return strings.Join(out, "\n")
+}
+
+// --- slash-command palette ------------------------------------------------
+
+// paletteMaxRows caps the slash-command list so the conversation stays
+// visible while it is open.
+const paletteMaxRows = 8
+
+// paletteOpen reports whether the composer holds a single-line value starting
+// with "/" (the palette trigger). The palette only interacts while idle.
+func (m Model) paletteOpen() bool {
+	if m.streaming || m.confirming || m.compressing {
+		return false
+	}
+	v := m.textarea.Value()
+	if v == "" || strings.Contains(v, "\n") {
+		return false
+	}
+	return v[0] == '/'
+}
+
+// paletteWord is the text after "/" up to the first space ("no" in "/no").
+func (m Model) paletteWord() string {
+	v := strings.TrimPrefix(m.textarea.Value(), "/")
+	if i := strings.IndexAny(v, " \t"); i >= 0 {
+		v = v[:i]
+	}
+	return v
+}
+
+// paletteRows returns the commands matching the typed prefix.
+func (m Model) paletteRows() []cmdSpec {
+	return filterCommands(m.paletteWord())
+}
+
+// paletteVisible reports whether the palette list should be drawn: idle, "/"
+// typed, at least one match, and the typed word is not already a complete
+// command name (nothing left to choose — Enter runs it directly).
+func (m Model) paletteVisible() bool {
+	if !m.paletteShow || !m.paletteOpen() {
+		return false
+	}
+	rows := m.paletteRows()
+	if len(rows) == 0 {
+		return false
+	}
+	for _, c := range rows {
+		if strings.TrimPrefix(c.name, "/") == m.paletteWord() {
+			return false
+		}
+	}
+	return true
+}
+
+// clampPalette keeps the selection within the filtered command list.
+func (m *Model) clampPalette() {
+	if n := len(m.paletteRows()); n > 0 {
+		m.paletteSel %= n
+		if m.paletteSel < 0 {
+			m.paletteSel = 0
+		}
+	}
+}
+
+// paletteList renders up to maxRows palette rows (name left, description
+// after, selected row highlighted), width-padded to maxW.
+func (m Model) paletteList(maxRows, maxW int) []string {
+	rows := m.paletteRows()
+	n := len(rows)
+	if n == 0 {
+		return nil
+	}
+	if maxRows > n {
+		maxRows = n
+	}
+	start := 0
+	if m.paletteSel >= maxRows {
+		start = m.paletteSel - maxRows + 1
+	}
+	nameW := 0
+	for _, c := range rows {
+		if w := len(strings.TrimPrefix(c.name, "/")); w > nameW {
+			nameW = w
+		}
+	}
+	out := make([]string, 0, maxRows)
+	for i := start; i < start+maxRows; i++ {
+		c := rows[i]
+		name := c.name
+		row := name + strings.Repeat(" ", nameW+2-len(strings.TrimPrefix(c.name, "/"))) + c.desc
+		if maxW > 0 {
+			if pad := maxW - lipgloss.Width(row); pad > 0 {
+				row += strings.Repeat(" ", pad)
+			}
+		}
+		if i == m.paletteSel {
+			out = append(out, ui.palSel.Render(row))
+		} else {
+			out = append(out, ui.palItem.Render(row[:len(name)])+ui.palDesc.Render(row[len(name):]))
+		}
+	}
+	return out
+}
+
+// paletteBlock renders the palette list for the conversation view's live slot.
+func (m Model) paletteBlock() string {
+	maxRows := min(paletteMaxRows, maxInt(m.conv.height-1, 1))
+	lines := m.paletteList(maxRows, m.contentWidth())
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+// paletteComplete fills in the selected command name, keeping any text after
+// the word (arguments), and moves the cursor to the end.
+func (m Model) paletteComplete() (tea.Model, tea.Cmd) {
+	rows := m.paletteRows()
+	if len(rows) == 0 {
+		return m, nil
+	}
+	sel := rows[m.paletteSel%len(rows)]
+	name := strings.TrimPrefix(sel.name, "/")
+	v := m.textarea.Value()
+	rest := ""
+	if i := strings.IndexAny(v, " \t"); i >= 0 {
+		rest = v[i:]
+	}
+	m.textarea.SetValue("/" + name + rest)
+	m.textarea.CursorEnd()
+	m.paletteShow = true
+	m.clampPalette()
+	m.updateViewport()
+	return m, m.reconcileComposerCursor()
 }
 
 // --- helpers -------------------------------------------------------------
@@ -1627,27 +2279,3 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
-
-const helpText = "**garess commands**\n\n" +
-	"- `/help` — this help\n" +
-	"- `/new` — start a new session\n" +
-	"- `/quit` — exit\n" +
-	"- `/model <name>` — switch provider (`/model deepseek/deepseek-chat`)\n" +
-	"- `/notes list` — list memory notes\n" +
-	"- `/notes read <name>` — show a note (local shadows global)\n" +
-	"- `/notes write [-g] <name> <text>` — save a note (`-g` = global)\n" +
-	"- `/notes rm <name>` — delete a local note\n" +
-	"- `/agents` — show the AGENTS.md / SYSTEM.md files in effect\n" +
-	"- `/agents reload` — re-read AGENTS.md / SYSTEM.md from disk\n" +
-	"- `/skills` — show installed skills in effect\n" +
-	"- `/skills reload` — re-read skills from disk\n" +
-	"- `/tools` — show the built-in tool policy and available tools\n" +
-	"- `/compress [instructions]` — compress the conversation into a summary\n" +
-	"  (`/compact` works too; optional instructions steer the summary)\n\n" +
-	"**Keys**\n\n" +
-	"- `enter` — send\n" +
-	"- `ctrl+j` — insert newline\n" +
-	"- `ctrl+t` — show/hide the model's thinking\n" +
-	"- `y` / `n` — approve / deny a tool that asks for confirmation\n" +
-	"- `esc` — stop the current response (or deny a confirmation)\n" +
-	"- `ctrl+c` — quit"

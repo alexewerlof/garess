@@ -2,8 +2,10 @@
 
 garess is a minimal AI harness written in Go: an OpenAI-compatible chat client
 with a Claude-Code-style TUI, project/global memory, JSONL session transcripts
-and AGENTS.md/SYSTEM.md support. Model "thinking" (reasoning) is captured and stored but
-hidden by default — press `ctrl+t` (as in Pi) to show or hide it. It
+and AGENTS.md/SYSTEM.md support. Model "thinking" (reasoning) is captured and
+stored; while the model thinks, a live `Thinking` row appears in the
+conversation under your message — press `ctrl+t` (as in Pi) to expand it to
+the reasoning text, or hide it again. It
 cross-compiles to a static 32-bit ARMv6 binary for a Raspberry Pi 1.
 
 This file is read by garess itself: running `garess` from this directory
@@ -115,7 +117,7 @@ one in the folder you are editing.
   loop (model → tool call → execute → feed back → repeat) runs inside the ADK
   runner; the TUI renders its events. The custom chat-completions `model.LLM`
   in `internal/llm` keeps llama.cpp compatibility and `reasoning_content`
-  thinking (hidden behind `ctrl+t`).
+  thinking (live `Thinking` row in the conversation, reasoning behind `ctrl+t`).
 - Phase 3 — implemented via ADK `plugin.Plugin` on `runner.Config.PluginConfig`
   (`internal/hooks`): git-style shell hooks from `[[hooks]]` config entries
   covering session (before/after run, on*event, on_user_message), agent,
@@ -199,3 +201,58 @@ CoveredThroughEventID` (summary sticky under `history_limit`) — the JSONL
 of W` (grouped numbers, 1-decimal % < 10). Keys are gated while
   `compressing` (esc cancels, pending pre-send text is restored on cancel).
   Anti-thrash: `ctxNoAutoAfter` event watermark after each auto-compress.
+
+## TUI look & feel (Phase 7, 2026-09-05)
+
+An opencode-inspired visual redesign (warm-orange identity kept; adapts to
+the `tui.theme` dark/light automatically — no new config):
+
+- **Hero empty state.** A new session with no content shows a pixel-block
+  `garess` logo (internal/tui/logo.go, 5x5 font, double-width `██`), a
+  tagline, the editor panel centered on the terminal background, and a hint
+  line; the editor drops to the bottom once a conversation starts.
+- **Editor panel.** The composer textarea sits on a subtly lighter background
+  spanning the content width (`ui.composer`, `editorBox`) with NO border —
+  the background difference is the boundary (opencode-style). Panel height is
+  exactly 4 rows (1 top + 1 bottom padding + 2 textarea rows) — keep
+  `layout()`'s `composerH` in sync.
+- **Message rails.** The conversation view is zone-tagged per line
+  (`convView`: `zoneUser`/`zoneAssistant`/`zonePlain`); user messages get a
+  blue left rail, assistant messages a rose rail, and everything internal
+  (thinking, tool calls/results, compression, summaries, ephemera) is plain
+  and dim. Rails are painted as a precomputed per-line ANSI prefix in
+  `view()` (O(height), no width math) and skip blank lines so each message
+  reads as its own block. `renderEvent` appends one trailing blank line per
+  completed event for spacing.
+- **Bottom bar.** The old top header is gone; the status line now shows the
+  busy state / error / `provider · model` on the left and the `ctx` readout +
+  app version on the right. Tool calls/results render as compact dim
+  `⚙ name`/`↳ name` blocks (display-capped; the model still sees full output).
+- **Slash-command palette.** Typing `/` at the start of the composer lists
+  commands from the `commands.go` registry (`name` + description, selected
+  row orange). `↑`/`↓` move the selection, `tab`/`enter` complete the
+  highlighted command (arguments after the word are kept), `esc` dismisses.
+  When the typed word IS a complete command the list hides and `enter` runs
+  it (unchanged behavior — `/new`, `/notes x`, etc. still work from tests).
+  The registry is the single source of truth for `/help` and the palette.
+- **Right rail + resume (implemented 2026-09-05).** `railActive()` is true at
+  terminal width >= 140 AND when a session service is wired (cmd passes
+  `Options.SessionService` = the chat svc); it reserves `railWidth` = 34 cols
+  and draws a full-height column right of the frame (heading, current-session
+  card, recent-session list, key hint) via `internal/tui/sessions.go`
+  (`railRows`/`railFrame`/`wrapFrame`). Per-frame width math happens ONLY
+  while the rail is active (desktop) — at 118 cols (the Pi) it never runs.
+  `tab` moves focus to the rail list (`↑↓` pick, `enter` resume, `esc` back);
+  `/sessions` opens the same list as an in-conversation picker that works at
+  any width. Resuming (`resumeSession`) loads the session's model view
+  (`chat.Service.SessionView`: compaction-filtered + history-capped, exactly
+  what the runner feeds the model next) into `m.events`/`m.rendered`, sets
+  `m.sessionID` (the runner resolves the session per Run — no rebuild), and
+  re-estimates ctx usage. The session list is cached on the Model and loaded
+  async (`sessionsMsg`/`loadSessions`): at Init, after each finished turn,
+  `/new` and resume. `chat.Recent` (newest first, preview = first user line)
+  backs the list. See /memories/repo/garess-tui-redesign-notes.md.
+- Per-frame rules still apply: rails and panels must not add lipgloss width
+  math per visible line; the editor panel's `Width` pass is bounded to its 4
+  rows. Validate on the Pi at 118 cols with GARESS_STATS (rail stays off
+  there).

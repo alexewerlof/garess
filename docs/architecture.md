@@ -89,7 +89,17 @@ model.
 `session.Service` (Create/Get/List/Delete/AppendEvent) with one
 `session.Event` per line plus a `.meta.json` sidecar. The service trims to
 `history_limit` on read; **Partial events are never persisted**. It passes
-ADK's conformance suite.
+ADK's conformance suite. Two non-ADK helpers serve the TUI's session rail
+and resume: `Recent` (a lightweight newest-first list with a preview line)
+and `SessionView` (the compaction-filtered, history-capped events of one
+session — exactly the transcript the runner feeds the model next).
+
+**Past sessions are resumable in the TUI.** The right rail (>= 140 columns)
+and `/sessions` both list recent sessions; `resumeSession` loads
+`SessionView` into the display, switches `Model.sessionID`, and lets the
+runner `Get` the existing session on the next turn — so continued messages
+append to the resumed session's JSONL. The recent-session list is cached on
+the Model and refreshed asynchronously (never on the Bubble Tea hot path).
 
 **Hooks are an ADK plugin** (`internal/hooks`). Only callbacks for configured
 events are registered (zero overhead otherwise). Blocking (`before_*`) hooks

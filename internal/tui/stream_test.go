@@ -123,7 +123,7 @@ func TestViewIncludesStreamingSlot(t *testing.T) {
 	m.showThinking = false
 	m.updateViewport()
 	view = joinAll(m.conv)
-	if !strings.Contains(view, "thinking") {
+	if !strings.Contains(view, "Thinking") {
 		t.Errorf("hidden thinking header missing: %q", view)
 	}
 	if strings.Contains(view, "secret reasoning") {

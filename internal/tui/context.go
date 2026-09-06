@@ -42,6 +42,11 @@ type Options struct {
 	// DefaultContextWindow overrides the fallback window for providers that
 	// have no configured window.
 	DefaultContextWindow int
+	// Version is the app version shown on the bottom bar ("" hides it).
+	Version string
+	// SessionService lets the TUI list and resume past sessions (right rail
+	// and /sessions). nil hides those features.
+	SessionService session.Service
 }
 
 // windowInfo is the resolved context window for one provider.
@@ -278,7 +283,7 @@ func (m Model) handleCompressResult(msg compressMsg) (tea.Model, tea.Cmd) {
 		m.pendingSend = nil
 		m.pendingText = ""
 		m.updateViewport()
-		return m, nil
+		return m, m.reconcileComposerCursor()
 	}
 	if msg.summary == nil {
 		m.err = "context compression produced no summary"

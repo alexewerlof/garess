@@ -111,3 +111,48 @@ func TestConvViewViewPadsWhenShort(t *testing.T) {
 		t.Fatalf("first line = %q", lines[0])
 	}
 }
+
+func TestConvViewRails(t *testing.T) {
+	cv := newConvView(20)
+	// User + assistant zones get a rail; the blank separator line inside a
+	// railed block must NOT (so each message reads as its own railed block);
+	// plain zones never get one.
+	cv.appendStableZ("user one\n\nuser two", zoneUser)
+	cv.appendStableZ("assistant reply", zoneAssistant)
+	cv.appendStable("plain block")
+	out := cv.view()
+	lines := strings.Split(out, "\n")
+	if len(lines) < 5 {
+		t.Fatalf("view lines = %d (%q)", len(lines), out)
+	}
+	if !strings.HasPrefix(lines[0], ui.userRail) {
+		t.Errorf("user line 1 missing rail: %q", lines[0])
+	}
+	if lines[1] != "" {
+		t.Errorf("blank line should stay clean, got %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], ui.userRail) {
+		t.Errorf("user line 2 missing rail: %q", lines[2])
+	}
+	if !strings.HasPrefix(lines[3], ui.assistantRail) {
+		t.Errorf("assistant line missing rail: %q", lines[3])
+	}
+	if strings.HasPrefix(lines[4], railChar) {
+		t.Errorf("plain block must not be railed: %q", lines[4])
+	}
+}
+
+func TestConvViewSetLiveZone(t *testing.T) {
+	cv := newConvView(10)
+	cv.setLiveZ("streaming tail", zoneAssistant)
+	if len(cv.live) != 1 || len(cv.liveZones) != 1 {
+		t.Fatalf("live lines/zones = %d/%d", len(cv.live), len(cv.liveZones))
+	}
+	if cv.zoneAt(0) != zoneAssistant {
+		t.Errorf("live zone = %v, want assistant", cv.zoneAt(0))
+	}
+	cv.clearLive()
+	if len(cv.live) != 0 || len(cv.liveZones) != 0 {
+		t.Errorf("clearLive left live=%d zones=%d", len(cv.live), len(cv.liveZones))
+	}
+}

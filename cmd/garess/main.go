@@ -247,6 +247,8 @@ func runTUI(cfgPath, providerName, modelName string) error {
 		AutoCompress:    cfg.Session.AutoCompressEnabled(),
 		AutoCompressPct: cfg.Session.AutoCompressThresholdPct(),
 		ContextWindows:  resolveContextWindows(cfg),
+		Version:         version,
+		SessionService:  svc, // right session rail + /sessions resume
 	})
 	if err != nil {
 		return err

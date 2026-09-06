@@ -86,14 +86,24 @@ Key rules (each one caused a real bug):
   (`answerConfirmation`) resumes `startStream` with a FunctionResponse for
   every pending wrapper. Gotcha: `answerConfirmation` MUST return the model
   value produced by `startStream` (never a fresh copy).
-- **Thinking blocks.** Model reasoning arrives as `genai.Part{Thought: true}`;
-  hidden by default, `ctrl+t` toggles `m.showThinking` and re-renders.
-  Streaming thinking is chunked too — `m.assistantThinking` is a
-  `streamChunker` with a lipgloss renderer (`newStreamChunkerWith`), so only
-  the thinking tail re-renders per batch. Never re-render the whole thinking
-  per batch (that was `renderThinking(allThinking)` in the old `streamTail`)
-  — with ctrl+t on it made updateViewport quadratic again while the model
-  reasoned.
+- **Thinking blocks (live, opencode/openrouter-style).** Model reasoning
+  arrives as `genai.Part{Thought: true}`; the REASONING TEXT is hidden by
+  default behind a live in-conversation `Thinking` header, and `ctrl+t`
+  toggles `m.showThinking` to expand it (the thoughts stream live).
+  `m.generationPending` (set in `startStream`, and after each tool-result
+  event in `handleADK`; cleared when visible text starts, on a completed
+  model/tool-call event, and in `finishStreaming`) drives the live slot:
+  `updateViewport` shows `thinkingIndicator()` — an animated `Thinking …`
+  placeholder before the first delta, then the real thinking block — until
+  visible text arrives, so the indicator sits in the conversation right under
+  the user's message instead of only in the status bar (status verb:
+  `streamVerb()` thinking/responding/working). The placeholder animates via
+  the spinner tick. Streaming thinking is chunked too — `m.assistantThinking`
+  is a `streamChunker` with a lipgloss renderer (`newStreamChunkerWith`), so
+  only the thinking tail re-renders per batch. Never re-render the whole
+  thinking per batch (that was `renderThinking(allThinking)` in the old
+  `streamTail`) — with ctrl+t on it made updateViewport quadratic again while
+  the model reasoned.
   **Thinking freezes when visible text starts** (`freezeThinking` in
   `flushStream`): the rendered thinking becomes `m.thinkingBlock`, a stable
   part placed BEFORE the response chunks in `stableParts`, and drops out of
@@ -105,8 +115,11 @@ Key rules (each one caused a real bug):
 - **Instructions.** AGENTS.md/SYSTEM.md + skills text is pushed into the
   shared `harness.Preamble` (read by the agent's InstructionProvider every
   run); `/agents reload` / `/skills reload` just update it — no rebuild.
-- **Commands.** Slash commands live in `handleCommand`: `/help /new /quit
-/model /notes /agents /skills /tools`. Add new ones there and to `helpText`.
+- **Commands.** Slash commands live in the `commands.go` registry (single
+  source of truth for `/help`, the slash palette and dispatch): `/help /new
+/quit /model /notes /agents /skills /tools /sessions /compress`. Add new
+  ones to the `commands` slice + attach `run` in `init()` (see the init-cycle
+  gotcha below). `/sessions` opens the resume picker.
 
 Testing: see `model_test.go`. Run programs with
 `tea.NewProgram(m, tea.WithInput(blockingReader{}), tea.WithOutput(io.Discard))`
@@ -155,3 +168,104 @@ sending `Quit`.
 of W` (`fmtCount` grouped numbers, `fmtPct` 1-decimal % under 10).
 - Value-copy rules apply to compression too: the goroutine only reads
   snapshots captured at `startCompression` time (never the Model).
+
+## Look & feel (2026-09-05) — hero, rails, palette, bottom bar
+
+- **Theme-aware styles.** `styles.go` defines `darkColors`/`lightColors` +
+  `buildStyles`; `resolveUI(theme)` (called from `New`) picks the active
+  `ui` set (defaults to dark for tests). Warm-orange accent is the brand;
+  user = blue rail, assistant = rose rail, internal blocks dim/plain.
+- **Message rails = per-line zones.** `convView` keeps parallel
+  `zones`/`liveZones` arrays; `appendStableZ`/`setLiveZ` tag content.
+  `view()` prefixes railed lines with the precomputed ANSI rail
+  (`railPrefix`) and SKIPS blank lines (message separators stay clean). No
+  lipgloss/width math per line — keep it that way (Pi). Plain-zone
+  `appendStable`/`setLive` remain for tests/benches. `stableParts()`
+  returns `[]taggedPart`; `zoneForEvent` maps events (summary/tools → plain,
+  user → user, assistant incl. thinking → assistant). `renderEvent` adds one
+  trailing `\n` per completed event for spacing (see `renderEventInner`).
+- **Hero empty state.** `hero()` is true when `len(m.rendered)==0` (and not
+  busy). `View`/`frame` render `heroBlock()` + `statusLine`; heroBlock
+  returns EXACTLY `height-1` rows (pixel logo via `logo.go`, tagline, editor
+  panel via `editorBox`, hint), vertically centered. First message → normal
+  layout.
+- **Editor panel.** The prompt box wears the SAME left rail as user messages:
+  `editorBox(w)` renders the panel at `w-ui.composerInner` and prefixes every
+  row with `ui.composerRail` (the user rail painted over the panel
+  background). The composer style has NO left padding (the rail owns those
+  cells), so typed text stays at the conversation's column. Borderless: the
+  panel is `Background(panelBG) + Padding(1,2,1,0)`, so the color difference
+  is the boundary. `composerH` is 4 in `layout()` (bubbles textarea at height
+  2 renders 2 rows + 2 padding rows). `ta.Prompt=""` removes the prompt
+  glyph.
+  `styleTextarea` (called in `New`) overrides the bubbles styles so the
+  textarea blends into the panel. THREE things matter: (1) NO `CursorLine`
+  block background (the textarea default paints an adaptive background
+  behind the whole placeholder row — the old "darker highlight"); (2) the
+  PANEL background is BAKED into every content style (`Text`, `CursorLine`,
+  `Placeholder`, `EndOfBuffer`, `Prompt`) because the textarea emits style
+  resets around its typed text — without the baked bg those rows fall back to
+  the terminal's default (darker) background inside the lighter panel; and
+  (3) the EMPTY composer never uses the textarea's own placeholder rendering
+  (`composerBody()` draws the placeholder + blank row directly with
+  `ui.placeholderBody` when `Value()==""`): bubbles `placeholderView` doesn't
+  pad its short rows with a background, and the textarea's internal
+  (unexported) viewport fills the rest of each row with PLAIN cells — a black
+  band after the placeholder that the outer panel background cannot repaint.
+- **Cursor hidden while the composer is empty.** bubbles renders its block
+  cursor OVER the first placeholder character, and the reverse-video box
+  reads as a black block next to the placeholder. `reconcileComposerCursor()`
+  (called in `New`, after every textarea mutation in `handleKey`/`send`/
+  `paletteComplete`, the compress-cancel restore and session resume) keeps
+  the cursor in `cursor.CursorHide` mode while `Value()==""` and flips it to
+  `cursor.CursorBlink` (returning the blink-start command) on the first typed
+  character — so the placeholder renders clean and typing still gets the
+  blinking block cursor. cursor.Model exposes `Mode()`; `SetMode(CursorBlink)`
+  returns the cmd that (re)starts the blink cycle.
+- **Slash palette.** Trigger: idle + single-line value starting with `/`.
+  `paletteVisible()` hides when the typed word equals a full command (so
+  `enter` still runs it — tests depend on this). Palette renders as the
+  conversation live slot (`updateViewport`) or inside `heroBlock`;
+  `handleKey` intercepts `↑↓/tab/enter/esc/ctrl+c` when visible; textarea
+  edits re-arm (`paletteShow`) and refresh via `updateViewport`. Commands
+  come from the `commands.go` registry (also drives `/help`); handlers are
+  attached in `init()` because stored closures that call `helpText()` in the
+  slice literal create a Go initialization cycle.
+- **Bottom bar.** `statusLine` = busy/error/`provider · model` left, `ctx`
+  readout + `Options.Version` right. No top header anymore.
+
+## Right session rail + resume (2026-09-05) — internal/tui/sessions.go
+
+- The rail renders when `railActive()`: width >= `railMinWidth` (140) AND
+  `sessionSvc != nil` (the concrete `*chat.Service` behind
+  `Options.SessionService`). `contentWidth()` = width - `railWidth` (34) when
+  active; the markdown renderer and all wrap widths use it, so content never
+  runs under the rail. Per-frame width math (padding each frame line to the
+  content width, `railFrame`) runs ONLY while the rail is active — desktop
+  only, never at 118 cols on the Pi.
+- Layout: `View`/`frame` compose the normal frame, then `wrapFrame` →
+  `railFrame` lays it side by side with `railRows(height)` (full-height
+  column: heading, current-session card, `past` list, bottom key hint). The
+  hero empty state centers within the content column and lists past sessions
+  the same way. Every rail row is `fit()` to `railWidth-2`; selected rows are
+  painted with the accent background (`ui.railSel`).
+- **List loading is async**: `loadSessions()` (tea Cmd) → `sessionsMsg` →
+  `handleSessions` updates `m.sessions` (nil = not loaded yet → "loading…").
+  Refreshed at Init, after each finished turn (`finishStreaming`), `/new`,
+  and after a resume. `chat.Recent` (see internal/chat) backs it — newest
+  first, preview = first user line, cap `railMaxSessions`.
+- **Interaction.** `tab` (idle, rail active, entries exist) →
+  `enterRailFocus`; while focused, `↑↓` move (`moveSessionsSel`), `enter`
+  resumes (`resumeSelectedSession`), `esc`/`tab`/typing returns focus
+  (`exitRailFocus` — clears the rail status hint). `/sessions` opens the same
+  list as an in-conversation picker (`sessionsShow`, live slot in
+  `updateViewport`, or inside `heroBlock`) that works at any width; typing or
+  `esc` closes it.
+- **Resume** (`resumeSession(id)`) loads `chat.Service.SessionView`
+  (compaction-filtered + history-capped — the exact model view) into
+  `m.events`/`m.rendered`, sets `m.sessionID` + `m.summaryEventID` and resets
+  per-session state; the ADK runner `Get`s the existing session per Run (no
+  rebuild). Display == what the model continues from. New turns append to the
+  resumed session's JSONL.
+- Value-copy rules apply: `sessions`/`railFocused` etc. are plain Model
+  fields; async code only reads snapshots.
