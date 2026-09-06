@@ -13,5 +13,4 @@ SYSTEM.md
 **/AGENTS.md
 Makefile
 .goreleaser.yml
-example-config.toml
 README.md

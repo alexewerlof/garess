@@ -37,10 +37,10 @@ Finish changes with `go build ./... && go test ./...`; keep `gofmt` clean
 
 | Path                | Purpose                                                                               |
 | ------------------- | ------------------------------------------------------------------------------------- |
-| `cmd/garess/`       | Entry point, flags, `doctor` subcommand, friendly config errors                       |
+| `cmd/garess/`       | Entry point, flags, subcommands (`init`, `doctor`, `help`), friendly config errors    |
 | `internal/agents/`  | AGENTS.md + SYSTEM.md discovery + rendering (`@import` imports, env-var substitution) |
 | `internal/chat/`    | Sessions + JSONL transcripts (`.garess/sessions/`)                                    |
-| `internal/config/`  | TOML config, XDG paths, merge, typed errors                                           |
+| `internal/config/`  | TOML config, XDG paths, merge, typed errors, embedded example template (`Example()`)  |
 | `internal/harness/` | ADK agent + runner wiring (tools, policy, hooks plugin)                               |
 | `internal/hooks/`   | Git-style shell hooks (config `[[hooks]]`, ADK plugin, exit-code abort)               |
 | `internal/llm/`     | Custom ADK `model.LLM` over OpenAI-compatible chat completions (no SDK)               |
@@ -80,6 +80,9 @@ one in the folder you are editing.
   `cmd/garess/main.go` — preserve that pattern.
 - Config search order: `~/.config/garess/config.toml` → `.garess/config.toml` →
   `config.toml` (project root fallback). Endpoints must include `/v1`.
+  `garess init` writes a starter config (the bundled example) to
+  `./config.toml`, or with `-g` to the global location; `garess -h` lists the
+  commands.
 - API keys: `GA_RESS_API_KEY` env var wins over the `api_key` config field.
 - Memory notes: local `.garess/memory/`, global `~/.config/garess/memory/`.
 - `tui.New` takes `workDir string` (used for AGENTS.md discovery).

@@ -20,7 +20,7 @@ desktop.
   (ADK HITL round trip).
 - **Git-style shell hooks** — commands run on agent/tool/model/session
   events; blocking hooks abort the operation on non-zero exit.
-- **Landlock write sandbox** (opt-in) — confines tool *writes* to the project
+- **Landlock write sandbox** (opt-in) — confines tool _writes_ to the project
   while leaving reads and execution unrestricted.
 - **Memory notes** in two scopes: project (`.garess/memory/`) and global
   (`~/.config/garess/memory/`).
@@ -46,7 +46,7 @@ static single-file binaries for Linux, macOS, Windows and FreeBSD;
 ```sh
 curl -sL -o garess https://github.com/alexewerlof/garess/releases/latest/download/garess-linux-amd64
 chmod +x garess
-cp example-config.toml ~/.config/garess/config.toml
+./garess init -g                       # create ~/.config/garess/config.toml
 $EDITOR ~/.config/garess/config.toml   # set your provider/endpoint
 ./garess doctor                        # verify config + endpoint
 ./garess                               # start chatting
@@ -66,7 +66,7 @@ docker run -it --rm \
 ```sh
 git clone <this repo> && cd garess
 make build                          # -> dist/garess
-cp example-config.toml ~/.config/garess/config.toml
+./dist/garess init -g               # create ~/.config/garess/config.toml
 $EDITOR ~/.config/garess/config.toml   # set your provider/endpoint
 ./dist/garess doctor                # verify config + endpoint
 ./dist/garess                       # start chatting
@@ -86,19 +86,19 @@ Two audiences, two paths — all docs live in [`docs/`](docs/):
 
 ### End users (getting work done)
 
-| Doc | What it covers |
-| --- | --- |
-| [Getting started](docs/getting-started.md) | Install, configure, first chat |
-| [Using the TUI](docs/usage.md) | Keys, slash commands, memory notes, sessions, AGENTS.md/skills |
-| [Configuration](docs/configuration.md) | Full TOML reference (providers, hooks, sandbox, env vars) |
-| [Safety model](docs/safety.md) | Tool approvals, hooks, and the sandbox — what is and isn't protected |
+| Doc                                        | What it covers                                                       |
+| ------------------------------------------ | -------------------------------------------------------------------- |
+| [Getting started](docs/getting-started.md) | Install, configure, first chat                                       |
+| [Using the TUI](docs/usage.md)             | Keys, slash commands, memory notes, sessions, AGENTS.md/skills       |
+| [Configuration](docs/configuration.md)     | Full TOML reference (providers, hooks, sandbox, env vars)            |
+| [Safety model](docs/safety.md)             | Tool approvals, hooks, and the sandbox — what is and isn't protected |
 
 ### Developers (hacking on garess)
 
-| Doc | What it covers |
-| --- | --- |
-| [Architecture](docs/architecture.md) | Packages, request flow, design decisions |
-| [Development](docs/development.md) | Build, test, cross-compile, profiling on slow hardware |
+| Doc                                  | What it covers                                         |
+| ------------------------------------ | ------------------------------------------------------ |
+| [Architecture](docs/architecture.md) | Packages, request flow, design decisions               |
+| [Development](docs/development.md)   | Build, test, cross-compile, profiling on slow hardware |
 
 ### AI agents
 

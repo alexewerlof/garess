@@ -32,7 +32,8 @@ Headers}` stored as-is on `Config.MCPServers`. `Validate` checks unique
   replaces a project/global server by name (like providers). Env/header
   semantics live in `internal/mcp`.
 - When adding a field, keep `merge`, `applyDefaults`, `Validate`, and the
-  tests in sync, and mirror the change in `example-config.toml` and
+  tests in sync, and mirror the change in `example-config.toml` (this
+  package — embedded via `Example()`, kept valid by `example_test.go`) and
   `docs/configuration.md`.
 
 ## Context settings (Phase 6)

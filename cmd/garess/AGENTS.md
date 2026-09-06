@@ -2,9 +2,10 @@
 
 CLI entry point, flag parsing and subcommands.
 
-- `main` → `run` parses flags then dispatches: TUI (no subcommand), `doctor`,
-  `help`. `--provider`/`--model` override the config; `--config` overrides the
-  search path.
+- `main` → `run` parses flags then dispatches: TUI (no subcommand), `init`,
+  `doctor`, `help`. `--provider`/`--model` override the config; `--config`
+  overrides the search path. Undefined `-h`/`-help`/`--help` are reported by
+  the flag package as `flag.ErrHelp` and print the matching usage (exit 0).
 - Config is loaded via `loadConfig` (wraps `config.Load`); errors are converted
   to friendly, actionable messages by `friendlyConfigError`:
   - `*config.NotFoundError` → lists every path searched plus a create command.
@@ -27,6 +28,9 @@ CLI entry point, flag parsing and subcommands.
   configured MCP servers with their tools (`reportMCP`, via
   `mcp.ListTools` — failures are printed, not fatal), and applicable
   AGENTS.md / SYSTEM.md files.
+- `runInit` (`garess init`) writes the bundled `config.Example()` template to
+  `./config.toml` (`-g` writes the global file at 0600, creating the dir; `-f`
+  overwrites; an existing file is refused without `-f`).
 - Structured logs go to a file (`~/.config/garess/garess.log`) via `slog` so
   the TUI owns stdout. Put new diagnostics in `doctor`, not on stdout.
 - Context window resolution (Phase 6): `resolveContextWindows(cfg)` maps each

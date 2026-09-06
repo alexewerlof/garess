@@ -1,8 +1,9 @@
 # Configuration
 
-`garess` is configured with TOML. The shipped
-[`example-config.toml`](../example-config.toml) is a complete, commented
-reference — copy it and edit.
+`garess` is configured with TOML. Run `garess init` to write a complete,
+commented starter config in the current folder (`garess init -g` writes the
+global `~/.config/garess/config.toml` instead) — the example template is
+bundled into the binary — then edit it.
 
 ## Discovery and merge
 

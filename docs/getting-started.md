@@ -18,15 +18,15 @@ Static single-file binaries are attached to every
 version. Verify integrity against the release's `checksums.txt`
 (`sha256sum -c checksums.txt`).
 
-| Platform | File |
-| --- | --- |
-| Linux x86-64 | `garess-linux-amd64` |
-| Linux arm64 | `garess-linux-arm64` |
-| Raspberry Pi 1 / Zero (armv6) | `garess-linux-armv6` |
-| macOS (Intel) | `garess-darwin-amd64` |
-| macOS (Apple Silicon) | `garess-darwin-arm64` |
-| Windows (experimental) | `garess-windows-amd64.exe` / `garess-windows-arm64.exe` |
-| FreeBSD amd64 / arm64 | `garess-freebsd-amd64` / `garess-freebsd-arm64` |
+| Platform                      | File                                                    |
+| ----------------------------- | ------------------------------------------------------- |
+| Linux x86-64                  | `garess-linux-amd64`                                    |
+| Linux arm64                   | `garess-linux-arm64`                                    |
+| Raspberry Pi 1 / Zero (armv6) | `garess-linux-armv6`                                    |
+| macOS (Intel)                 | `garess-darwin-amd64`                                   |
+| macOS (Apple Silicon)         | `garess-darwin-arm64`                                   |
+| Windows (experimental)        | `garess-windows-amd64.exe` / `garess-windows-arm64.exe` |
+| FreeBSD amd64 / arm64         | `garess-freebsd-amd64` / `garess-freebsd-arm64`         |
 
 Example (Linux):
 
@@ -56,7 +56,7 @@ docker run -it --rm \
 If your host uid is not 1000, add `--user $(id -u):$(id -g)` so the tools
 can write to the mounted directory. For a LAN llama.cpp server add
 `--network host` (or point the config at your host's IP). The Raspberry Pi 1
-is *not* served by the image — use the `garess-linux-armv6` binary from
+is _not_ served by the image — use the `garess-linux-armv6` binary from
 Option A.
 
 ### Option C — build from source
@@ -79,14 +79,14 @@ ssh user@rpi1 '~/garess-linux-armv6'
 
 ## 2. Configure
 
-Create a config from the example (the config file can hold API keys — keep it
-private):
+Create a starter config with `garess init` — it writes the fully commented
+example, which is bundled into the binary (no separate file to download). Use
+`-g` for the global location (created `0600`, as it may hold API keys), or
+omit it to write `./config.toml` in the current folder:
 
 ```sh
-mkdir -p ~/.config/garess
-cp example-config.toml ~/.config/garess/config.toml
-chmod 600 ~/.config/garess/config.toml
-$EDITOR ~/.config/garess/config.toml
+garess init -g
+$EDITOR ~/.config/garess/config.toml   # set your provider/endpoint
 ```
 
 At minimum, point a provider at your endpoint. Endpoints must include the
@@ -135,13 +135,13 @@ garess
 
 Type a prompt and press `enter`. Keys you will need immediately:
 
-| Key | Effect |
-| --- | --- |
-| `enter` | send the prompt |
-| `ctrl+j` | insert a newline (multi-line prompts) |
-| `esc` | stop the current response |
+| Key      | Effect                                       |
+| -------- | -------------------------------------------- |
+| `enter`  | send the prompt                              |
+| `ctrl+j` | insert a newline (multi-line prompts)        |
+| `esc`    | stop the current response                    |
 | `ctrl+t` | show / hide the model's thinking (reasoning) |
-| `ctrl+c` | quit |
+| `ctrl+c` | quit                                         |
 
 `/help` inside the app lists every command.
 

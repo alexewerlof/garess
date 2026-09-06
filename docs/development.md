@@ -12,15 +12,15 @@ How to build, test, measure, and contribute to `garess`. Start with
 
 ## Build
 
-| Command | Produces |
-| --- | --- |
-| `make build` | `dist/garess` (host) |
-| `make build-arm` | `dist/garess-linux-armv6` (static, `GOOS=linux GOARCH=arm GOARM=6`) |
-| `make VERSION=vX.Y.Z build` | host binary with the version stamped (`garess --version`) |
-| `make build-all` | every release asset into `dist/` (see `RELEASE_TARGETS`) |
-| `make run` | `go run ./cmd/garess` |
-| `make doctor` | `go run ./cmd/garess doctor` |
-| `make test` / `make vet` / `make fmt` | test suite / vet / gofmt |
+| Command                               | Produces                                                            |
+| ------------------------------------- | ------------------------------------------------------------------- |
+| `make build`                          | `dist/garess` (host)                                                |
+| `make build-arm`                      | `dist/garess-linux-armv6` (static, `GOOS=linux GOARCH=arm GOARM=6`) |
+| `make VERSION=vX.Y.Z build`           | host binary with the version stamped (`garess --version`)           |
+| `make build-all`                      | every release asset into `dist/` (see `RELEASE_TARGETS`)            |
+| `make run`                            | `go run ./cmd/garess`                                               |
+| `make doctor`                         | `go run ./cmd/garess doctor`                                        |
+| `make test` / `make vet` / `make fmt` | test suite / vet / gofmt                                            |
 
 `GOARM=6` is required for the Pi 1: Go 1.21+ defaults cross-builds to
 `GOARM=7`, and ARMv5 support was dropped. All release targets must stay
@@ -111,7 +111,8 @@ Notes learned the hard way during on-device validation:
   they can contain keys or local state).
 - When you add or change a package, keep its `AGENTS.md` in sync — agents and
   humans both navigate the repo through them. Mirror config changes in
-  `example-config.toml`.
+  `internal/config/example-config.toml` (bundled via `config.Example()`, kept
+  valid by `example_test.go`).
 - Config errors are typed (`*config.NotFoundError`,
   `*config.InvalidConfigError`) and mapped to friendly messages in
   `cmd/garess/main.go` — preserve that pattern.

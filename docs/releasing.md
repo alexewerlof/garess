@@ -36,7 +36,10 @@ sequenceDiagram
 
 - `make fmt` clean, `go vet ./...` and `go test ./...` pass.
 - `garess doctor` output is sensible (config + endpoint + sandbox).
-- User-visible changes are reflected in the docs and `example-config.toml`.
+- User-visible changes are reflected in the docs and
+  `internal/config/example-config.toml` — the bundled `garess init` template
+  (embedded via `config.Example()`; releases ship binaries only, no extra
+  files).
 - The tag must be new — a release for an existing tag is re-runnable but will
   fail/overwrite semantics; cut a new patch version instead (`v0.1.1`).
 
@@ -62,18 +65,18 @@ The GitHub Release at
 `https://github.com/alexewerlof/garess/releases/tag/v0.1.0` (or
 `gh release view v0.1.0`) with these assets:
 
-| Asset | Platform |
-| --- | --- |
-| `garess-linux-amd64` | Linux x86-64 (most desktops/servers) |
-| `garess-linux-arm64` | Linux ARM64 (Pi 4/5 on 64-bit OS, ARM servers) |
-| `garess-linux-armv6` | **Raspberry Pi 1 / Zero** |
-| `garess-darwin-amd64` | macOS (Intel) |
-| `garess-darwin-arm64` | macOS (Apple Silicon) |
-| `garess-windows-amd64.exe` | Windows (experimental — needs a TTY) |
-| `garess-windows-arm64.exe` | Windows on ARM64 (experimental — needs a TTY) |
-| `garess-freebsd-amd64` | FreeBSD amd64 |
-| `garess-freebsd-arm64` | FreeBSD arm64 |
-| `checksums.txt` | sha256 of every asset |
+| Asset                      | Platform                                       |
+| -------------------------- | ---------------------------------------------- |
+| `garess-linux-amd64`       | Linux x86-64 (most desktops/servers)           |
+| `garess-linux-arm64`       | Linux ARM64 (Pi 4/5 on 64-bit OS, ARM servers) |
+| `garess-linux-armv6`       | **Raspberry Pi 1 / Zero**                      |
+| `garess-darwin-amd64`      | macOS (Intel)                                  |
+| `garess-darwin-arm64`      | macOS (Apple Silicon)                          |
+| `garess-windows-amd64.exe` | Windows (experimental — needs a TTY)           |
+| `garess-windows-arm64.exe` | Windows on ARM64 (experimental — needs a TTY)  |
+| `garess-freebsd-amd64`     | FreeBSD amd64                                  |
+| `garess-freebsd-arm64`     | FreeBSD arm64                                  |
+| `checksums.txt`            | sha256 of every asset                          |
 
 And in GHCR (`docker buildx imagetools inspect
 ghcr.io/alexewerlof/garess:v0.1.0`): a multi-arch image (linux/amd64,

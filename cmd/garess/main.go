@@ -50,6 +50,13 @@ func run(args []string) error {
 	modelName := fs.String("model", "", "model to use (overrides the provider default)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
+		// -h / -help / --help are not defined flags: the flag package reports
+		// flag.ErrHelp (its default usage is already discarded) — show our own
+		// help instead of failing with an error.
+		if errors.Is(err, flag.ErrHelp) {
+			printUsage()
+			return nil
+		}
 		return err
 	}
 	if *showVersion {
@@ -61,9 +68,11 @@ func run(args []string) error {
 	case "":
 		setupLogging()
 		return runTUI(*cfgPath, *providerName, *modelName)
+	case "init":
+		return runInit(fs.Args()[1:])
 	case "doctor":
 		return runDoctor(fs.Args()[1:])
-	case "help", "-h", "--help":
+	case "help":
 		printUsage()
 		return nil
 	default:
@@ -76,14 +85,41 @@ func printUsage() {
 
 Usage:
   garess [flags]            start the chat TUI
+  garess init [flags]       write a starter config to edit
   garess doctor [flags]     check config, endpoint and sandbox support
   garess help               show this help
 
 Flags:
+  -h, --help        show this help
   --config <path>   use an explicit config file
   --provider <name> provider to use (overrides default_provider)
   --model <name>    model to use (overrides the provider default)
   --version         print the version and exit
+
+Init flags:
+  -g    write to the global config location (~/.config/garess/config.toml)
+  -f    overwrite an existing config file
+`)
+}
+
+func printInitUsage() {
+	fmt.Print(`Usage: garess init [-g] [-f]
+
+Writes a starter config from the bundled example-config.toml, ready for you
+to edit. By default writes ./config.toml in the current folder.
+
+  -g    write to the global config location (~/.config/garess/config.toml)
+  -f    overwrite an existing config file
+`)
+}
+
+func printDoctorUsage() {
+	fmt.Print(`Usage: garess doctor [--config <path>]
+
+Checks the configuration, endpoint connectivity, hooks, MCP servers and
+sandbox support.
+
+  --config <path>   use an explicit config file
 `)
 }
 
@@ -110,17 +146,14 @@ func friendlyConfigError(err error) error {
 			}
 			fmt.Fprintf(&b, "  - %s\n", p)
 		}
-		if len(nf.Searched) > 0 {
-			p := nf.Searched[0]
-			fmt.Fprintf(&b, "\nCreate one by copying example-config.toml:\n  mkdir -p %s\n  cp example-config.toml %s\n", filepath.Dir(p), p)
-		}
+		b.WriteString("\nCreate one with:\n  garess init      # writes ./config.toml in the current folder\n  garess init -g   # writes the global ~/.config/garess/config.toml\n")
 		return errors.New(strings.TrimSuffix(b.String(), "\n"))
 	}
 
 	var inv *config.InvalidConfigError
 	if errors.As(err, &inv) {
 		if errors.Is(inv.Err, config.ErrNoProviders) {
-			return fmt.Errorf("config %s was found but defines no LLM providers.\nAdd at least one [[providers]] block with name, endpoint and model — see example-config.toml.", inv.Path)
+			return fmt.Errorf("config %s was found but defines no LLM providers.\nAdd at least one [[providers]] block with name, endpoint and model (the starter config written by 'garess init' shows the format).", inv.Path)
 		}
 		return fmt.Errorf("config %s is invalid: %v", inv.Path, inv.Err)
 	}
@@ -287,11 +320,60 @@ func resolveContextWindows(cfg *config.Config) map[string]int {
 	return out
 }
 
+// runInit writes a starter config — the bundled example-config.toml — ready
+// for the user to edit. It writes ./config.toml in the current folder by
+// default, or the global config location with -g (creating the directory and
+// using 0600, since a global config may hold API keys). It refuses to
+// overwrite an existing file unless -f is given.
+func runInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	global := fs.Bool("g", false, "write the global config (~/.config/garess/config.toml)")
+	force := fs.Bool("f", false, "overwrite an existing config file")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printInitUsage()
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("init takes no arguments (got %q)", fs.Arg(0))
+	}
+
+	dest := config.RootConfigPath()
+	mode := os.FileMode(0o644)
+	if *global {
+		var err error
+		dest, err = config.GlobalConfigPath()
+		if err != nil {
+			return fmt.Errorf("resolve global config path: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
+		mode = 0o600
+	}
+
+	if _, err := os.Stat(dest); err == nil && !*force {
+		return fmt.Errorf("%s already exists — edit it, or pass -f to overwrite it", dest)
+	}
+	if err := os.WriteFile(dest, config.Example(), mode); err != nil {
+		return err
+	}
+	fmt.Printf("created %s — edit it, then run 'garess doctor' to verify\n", dest)
+	return nil
+}
+
 func runDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	cfgPath := fs.String("config", "", "path to a config file (default: global + project)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printDoctorUsage()
+			return nil
+		}
 		return err
 	}
 	cfg, err := loadConfig(*cfgPath)
