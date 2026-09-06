@@ -109,6 +109,13 @@ type Model struct {
 	pendingText     string         // original text (restored if compression is cancelled)
 	summaryEventID  string         // latest compaction summary event (styled distinctly)
 
+	// Type-ahead while busy: a prompt queued (Enter) during a streaming run.
+	// It is auto-sent when the run finishes cleanly; queuedText is handed back
+	// to the composer when the run is cancelled or fails instead of firing
+	// another run the user may not want.
+	queuedContent *genai.Content
+	queuedText    string
+
 	// HITL confirmation mode (ADK tool confirmation round trip).
 	confirming        bool
 	confirmPrompt     string
@@ -417,16 +424,38 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.streaming {
+		// The composer stays editable while the harness is busy so the user
+		// can compose the next prompt mid-turn. Control keys keep their
+		// streaming meaning; everything else edits the composer.
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			m.cancelStream()
-		case "up", "down", "pgup", "pgdown", "home", "end":
+			return m, nil
+		case "pgup", "pgdown", "home", "end":
 			m.scroll(msg.String())
 			return m, nil
+		case "up", "down":
+			// Scrollback stays available while streaming; arrows fall through
+			// to the composer when there is no overflow (same rule as idle),
+			// so the cursor can move within a multi-line draft.
+			if m.conv.maxScroll() > 0 {
+				m.scroll(msg.String())
+				return m, nil
+			}
 		case "ctrl+t":
 			return m.toggleThinking()
+		case "ctrl+j":
+			// Enter queues (see below), so ctrl+j is the newline key for a
+			// multi-line draft — same as the idle composer.
+			m.textarea.InsertString("\n")
+			return m, m.reconcileComposerCursor()
+		case "enter":
+			// Type-ahead: Enter queues the drafted prompt; it is sent when
+			// this run finishes (see finishStreaming). Commands are not
+			// dispatched mid-run — command text stays in the composer.
+			return m.queueWhileBusy()
 		}
-		return m, nil
+		return m.editComposer(msg)
 	}
 
 	// While an auto/manual compression is running, input is gated (esc can
@@ -590,20 +619,42 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		return m, nil
 	default:
-		prev := m.textarea.Value()
-		var cmd tea.Cmd
-		m.textarea, cmd = m.textarea.Update(msg)
-		// Edits re-arm the slash palette (esc dismisses it until the next
-		// edit) and keep its filtered list/selection live — it renders in the
-		// conversation live slot, so the list needs refreshing per keystroke.
-		if !m.streaming && !m.confirming && !m.compressing &&
-			(strings.HasPrefix(prev, "/") || strings.HasPrefix(m.textarea.Value(), "/")) {
-			m.paletteShow = true
-			m.clampPalette()
-			m.updateViewport()
-		}
-		return m, batchCmds(cmd, m.reconcileComposerCursor())
+		return m.editComposer(msg)
 	}
+}
+
+// editComposer passes a non-control key to the textarea so the composer edits
+// normally. The slash palette only re-arms while idle (it is hidden during
+// streaming/compressing), so the list is not refreshed on busy edits.
+func (m Model) editComposer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	prev := m.textarea.Value()
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(msg)
+	if !m.streaming && !m.confirming && !m.compressing &&
+		(strings.HasPrefix(prev, "/") || strings.HasPrefix(m.textarea.Value(), "/")) {
+		m.paletteShow = true
+		m.clampPalette()
+		m.updateViewport()
+	}
+	return m, batchCmds(cmd, m.reconcileComposerCursor())
+}
+
+// queueWhileBusy is Enter while a run is in flight: the prompt drafted in the
+// composer is queued and auto-sent when the current run finishes (see
+// finishStreaming). Command lines are not queued — commands are never
+// dispatched mid-turn, so the draft is left in the composer for after. A
+// second prompt is not queued while one is already pending: overwriting it
+// would silently drop the first, so the new draft stays in the composer.
+func (m Model) queueWhileBusy() (tea.Model, tea.Cmd) {
+	text := strings.TrimSpace(m.textarea.Value())
+	if text == "" || strings.HasPrefix(text, "/") || m.queuedContent != nil {
+		return m, nil
+	}
+	m.textarea.Reset()
+	m.reconcileComposerCursor() // empty again: drop the block cursor
+	m.queuedContent = genai.NewContentFromText(text, genai.RoleUser)
+	m.queuedText = text
+	return m, nil
 }
 
 // send submits the composer content as a user message.
@@ -823,6 +874,31 @@ func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 		m.ctxEst = m.estimatedPromptTokens()
 		m.ctxLastPrompt = 0
 	}
+
+	// Type-ahead flush: a prompt queued (Enter) while this run was busy is
+	// auto-sent now that the turn is over — riding any post-turn
+	// auto-compress so it fires after compression finishes. If the run was
+	// cancelled or failed, the queued text is handed back to the composer
+	// instead of firing another run the user may not want.
+	if m.queuedContent != nil {
+		queued := m.queuedContent
+		queuedText := m.queuedText
+		m.queuedContent = nil
+		m.queuedText = ""
+		if m.cancelled || m.streamFailed {
+			m.textarea.SetValue(queuedText)
+			m.updateViewport()
+			return m, batchCmds(refresh, m.reconcileComposerCursor())
+		}
+		if m.autoCompress && m.ctxEst >= m.thresholdTokens() &&
+			len(m.events) >= m.ctxNoAutoAfter {
+			mm, cmd := m.startCompression(true, "", queued, queuedText)
+			return mm, batchCmds(refresh, cmd)
+		}
+		mm, cmd := m.startStream(queued)
+		return mm, batchCmds(cmd, refresh)
+	}
+
 	// Auto-compress check after EVERY completed turn: a turn's tool outputs
 	// can be massive, so re-evaluate here (right after the run persisted
 	// them), not only when the user types the next prompt.
@@ -1078,6 +1154,10 @@ func (m Model) newSession() (tea.Model, tea.Cmd) {
 	m.ctxNoAutoAfter = 0
 	m.ctxUsageThisRun = false
 	m.compressIsAuto = false
+	// A message queued behind a busy run belongs to the previous session
+	// (commands only run idle, so this is normally already flushed).
+	m.queuedContent = nil
+	m.queuedText = ""
 	// The picker and rail focus describe the previous session; close them.
 	m.sessionsShow = false
 	m.railFocused = false
@@ -1964,7 +2044,11 @@ func (m Model) statusLine() string {
 	case m.confirming:
 		line = ui.confirm.Render("⚠ " + m.confirmPrompt + "  (y approve · n deny)")
 	case m.streaming:
-		line = ui.streaming.Render(spinnerFrames[m.spinnerIdx] + " " + m.streamVerb() + "  (esc to stop)")
+		verb := m.streamVerb() + "  (esc to stop)"
+		if m.queuedContent != nil {
+			verb += " · next prompt queued"
+		}
+		line = ui.streaming.Render(spinnerFrames[m.spinnerIdx] + " " + verb)
 	case m.err != "":
 		line = ui.err.Render("⚠ " + m.err)
 	case m.status != "":

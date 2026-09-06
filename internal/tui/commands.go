@@ -158,6 +158,8 @@ func helpText() string {
 		"- `ctrl+t` — show/hide the model's thinking\n" +
 		"- `y` / `n` — approve / deny a tool that asks for confirmation\n" +
 		"- `esc` — stop the current response (or deny a confirmation)\n" +
-		"- `ctrl+c` — quit")
+		"- `ctrl+c` — quit\n\n" +
+		"While the model is working you can keep typing your next prompt; " +
+		"`enter` queues it and it is sent once the current response finishes.")
 	return b.String()
 }

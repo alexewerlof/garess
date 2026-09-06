@@ -231,8 +231,38 @@ of W` (`fmtCount` grouped numbers, `fmtPct` 1-decimal % under 10).
   come from the `commands.go` registry (also drives `/help`); handlers are
   attached in `init()` because stored closures that call `helpText()` in the
   slice literal create a Go initialization cycle.
+- **Type-ahead while busy (2026-09-06).** The composer stays editable while
+  `m.streaming` (the harness busy state): `handleKey`'s streaming branch keeps
+  `esc`/`ctrl+c` (cancel), page/scroll keys, `ctrl+t` and `ctrl+j` (newline),
+  and routes `enter` to `queueWhileBusy()` — everything else goes through
+  `editComposer(msg)` (the same helper the idle path uses; the palette
+  re-arm is already idle-gated). `up`/`down` follow the idle overflow rule
+  (scroll when `maxScroll()>0`, else edit the composer). `queueWhileBusy`
+  trims the draft, clears the composer and stores `queuedContent`/`queuedText`
+  (ONE slot: a second Enter while one is pending keeps the new draft in the
+  composer rather than silently dropping the first; command lines are never
+  queued). `finishStreaming` flushes the queue: on a clean completion the
+  queued content is auto-sent via `startStream` (riding a post-turn
+  auto-compress as `pendingSend` if one fires); on cancel/failure the text is
+  restored to the composer instead of firing an unwanted run. The queue is NOT
+  flushed while `confirming` — it waits for the confirmation-resumed run to
+  finish. The status line appends `· next prompt queued` while one is pending.
 - **Bottom bar.** `statusLine` = busy/error/`provider · model` left, `ctx`
   readout + `Options.Version` right. No top header anymore.
+- **Type-ahead while busy (2026-09-06).** While `m.streaming` the composer
+  stays editable — the user can draft the next prompt mid-turn. Control keys
+  keep their streaming meaning (esc/ctrl+c cancel, ctrl+t thinking, scroll
+  keys scroll; `up`/`down` scroll only when the conversation overflows, else
+  they move the composer cursor, same rule as idle). `enter` calls
+  `queueWhileBusy()`: it stores `m.queuedContent`/`m.queuedText` (one slot;
+  a second Enter keeps the draft in the composer instead of overwriting;
+  command lines are never queued) and clears the composer. `finishStreaming`
+  flushes the queue: on a clean finish the prompt is auto-sent via
+  `startStream` (riding a post-turn auto-compress as `pending`); when the run
+  was cancelled or failed, `queuedText` is restored to the composer instead —
+  never fire a follow-up run the user may not want. The status bar shows
+  "· next prompt queued" while a prompt is pending. Commands stay gated
+  mid-run (the palette re-arm is guarded by `!m.streaming`).
 
 ## Right session rail + resume (2026-09-05) — internal/tui/sessions.go
 
