@@ -80,6 +80,9 @@ type styles struct {
 	// Messages.
 	userLabel lipgloss.Style
 	userBody  lipgloss.Style
+	// Type-ahead pending prompts (queued while busy, drawn above the composer).
+	pendingLabel lipgloss.Style
+	pendingBody  lipgloss.Style
 	// Internal (plain, dim) blocks.
 	thinkingHeader lipgloss.Style
 	thinkingBody   lipgloss.Style
@@ -146,6 +149,9 @@ func buildStyles(c colors) styles {
 
 		userLabel: base.Bold(true).Foreground(lipgloss.Color(c.user)),
 		userBody:  base.Foreground(lipgloss.Color(c.body)),
+
+		pendingLabel: base.Italic(true).Foreground(lipgloss.Color(c.dim)),
+		pendingBody:  base.Foreground(lipgloss.Color(c.faint)).PaddingLeft(2),
 
 		thinkingHeader: base.Italic(true).Foreground(lipgloss.Color(c.dim)),
 		thinkingBody:   base.Foreground(lipgloss.Color(c.faint)).PaddingLeft(2),

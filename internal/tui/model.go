@@ -109,12 +109,12 @@ type Model struct {
 	pendingText     string         // original text (restored if compression is cancelled)
 	summaryEventID  string         // latest compaction summary event (styled distinctly)
 
-	// Type-ahead while busy: a prompt queued (Enter) during a streaming run.
-	// It is auto-sent when the run finishes cleanly; queuedText is handed back
-	// to the composer when the run is cancelled or fails instead of firing
-	// another run the user may not want.
-	queuedContent *genai.Content
-	queuedText    string
+	// Type-ahead while busy: prompts queued (Enter) during a streaming run, in
+	// submission order (FIFO). finishStreaming pops the front and auto-sends it
+	// on a clean finish; on cancel/failure the queue is handed back to the
+	// composer instead of firing runs the user may not want. The queue renders
+	// as "Pending" blocks pinned above the composer (pendingRows).
+	queued []queuedPrompt
 
 	// HITL confirmation mode (ADK tool confirmation round trip).
 	confirming        bool
@@ -639,21 +639,43 @@ func (m Model) editComposer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, batchCmds(cmd, m.reconcileComposerCursor())
 }
 
+// queuedPrompt is one user prompt waiting for its turn (typed and Entered
+// while a run was busy): the text the user drafted plus the user content the
+// runner sends when the prompt is popped.
+type queuedPrompt struct {
+	content *genai.Content
+	text    string
+}
+
+const (
+	// maxQueuedPrompts caps the type-ahead queue so a backlog cannot grow
+	// without bound.
+	maxQueuedPrompts = 8
+	// pendingMaxShown caps how many queued prompts are expanded as individual
+	// blocks in the pending region; older ones collapse into a "+N more" row.
+	pendingMaxShown = 3
+)
+
 // queueWhileBusy is Enter while a run is in flight: the prompt drafted in the
-// composer is queued and auto-sent when the current run finishes (see
-// finishStreaming). Command lines are not queued — commands are never
-// dispatched mid-turn, so the draft is left in the composer for after. A
-// second prompt is not queued while one is already pending: overwriting it
-// would silently drop the first, so the new draft stays in the composer.
+// composer is appended to the type-ahead queue and auto-sent, one per finished
+// turn, when the current run finishes (see finishStreaming). Command lines are
+// not queued — commands are never dispatched mid-turn, so the draft is left in
+// the composer for after. A full queue keeps the draft in the composer too.
 func (m Model) queueWhileBusy() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.textarea.Value())
-	if text == "" || strings.HasPrefix(text, "/") || m.queuedContent != nil {
+	if text == "" || strings.HasPrefix(text, "/") || len(m.queued) >= maxQueuedPrompts {
 		return m, nil
 	}
 	m.textarea.Reset()
 	m.reconcileComposerCursor() // empty again: drop the block cursor
-	m.queuedContent = genai.NewContentFromText(text, genai.RoleUser)
-	m.queuedText = text
+	m.queued = append(m.queued, queuedPrompt{
+		content: genai.NewContentFromText(text, genai.RoleUser),
+		text:    text,
+	})
+	// The pending region grew, so the conversation viewport shrinks to match.
+	m.layout()
+	m.conv.clamp()
+	m.updateViewport()
 	return m, nil
 }
 
@@ -875,27 +897,30 @@ func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 		m.ctxLastPrompt = 0
 	}
 
-	// Type-ahead flush: a prompt queued (Enter) while this run was busy is
-	// auto-sent now that the turn is over — riding any post-turn
-	// auto-compress so it fires after compression finishes. If the run was
-	// cancelled or failed, the queued text is handed back to the composer
-	// instead of firing another run the user may not want.
-	if m.queuedContent != nil {
-		queued := m.queuedContent
-		queuedText := m.queuedText
-		m.queuedContent = nil
-		m.queuedText = ""
+	// Type-ahead flush: the front queued prompt (Entered while this run was
+	// busy) is auto-sent now that the turn is over — riding any post-turn
+	// auto-compress so it fires after compression finishes. Remaining queued
+	// prompts stay pending and send one per finished turn. If the run was
+	// cancelled or failed, the whole queue is handed back to the composer
+	// instead of firing runs the user may not want.
+	if len(m.queued) > 0 {
 		if m.cancelled || m.streamFailed {
-			m.textarea.SetValue(queuedText)
+			m.restoreQueuedToComposer()
+			m.layout() // the pending region shrank to nothing
+			m.conv.clamp()
 			m.updateViewport()
 			return m, batchCmds(refresh, m.reconcileComposerCursor())
 		}
+		front := m.queued[0]
+		m.queued = m.queued[1:]
+		m.layout() // the pending region shrank by the popped prompt
+		m.conv.clamp()
 		if m.autoCompress && m.ctxEst >= m.thresholdTokens() &&
 			len(m.events) >= m.ctxNoAutoAfter {
-			mm, cmd := m.startCompression(true, "", queued, queuedText)
+			mm, cmd := m.startCompression(true, "", front.content, front.text)
 			return mm, batchCmds(refresh, cmd)
 		}
-		mm, cmd := m.startStream(queued)
+		mm, cmd := m.startStream(front.content)
 		return mm, batchCmds(cmd, refresh)
 	}
 
@@ -908,6 +933,23 @@ func (m *Model) finishStreaming() (tea.Model, tea.Cmd) {
 		return mm, batchCmds(refresh, cmd)
 	}
 	return m, refresh
+}
+
+// restoreQueuedToComposer returns every queued prompt to the composer (in
+// order, one per line) and clears the queue. Used when a run is cancelled or
+// fails: nothing auto-fires after an interrupt, and the user keeps full
+// control of their drafted text. The single-prompt case behaves exactly like
+// the original type-ahead restore.
+func (m *Model) restoreQueuedToComposer() {
+	if len(m.queued) == 0 {
+		return
+	}
+	texts := make([]string, 0, len(m.queued))
+	for _, q := range m.queued {
+		texts = append(texts, q.text)
+	}
+	m.queued = nil
+	m.textarea.SetValue(strings.Join(texts, "\n"))
 }
 
 // --- HITL confirmation ----------------------------------------------------
@@ -1154,13 +1196,13 @@ func (m Model) newSession() (tea.Model, tea.Cmd) {
 	m.ctxNoAutoAfter = 0
 	m.ctxUsageThisRun = false
 	m.compressIsAuto = false
-	// A message queued behind a busy run belongs to the previous session
+	// Prompts queued behind a busy run belong to the previous session
 	// (commands only run idle, so this is normally already flushed).
-	m.queuedContent = nil
-	m.queuedText = ""
+	m.queued = nil
 	// The picker and rail focus describe the previous session; close them.
 	m.sessionsShow = false
 	m.railFocused = false
+	m.layout() // the pending region (if any) changed with the queue
 	m.resetView()
 	m.status = "new session started"
 	m.updateViewport()
@@ -1856,13 +1898,19 @@ func (m *Model) rebuildRenderer() {
 	m.md = md
 }
 
+// statusBarH / composerH are the fixed row counts of the bottom chrome: the
+// status line and the editor panel (1 top + 1 bottom padding + 2 textarea
+// rows). layout() splits the remaining rows between the conversation and the
+// pinned pending region.
+const (
+	statusBarH = 1
+	composerH  = 4
+)
+
 func (m *Model) layout() {
-	const (
-		statusH   = 1
-		composerH = 4 // panel: 1 top + 1 bottom padding + 2 textarea rows
-	)
 	contentW := m.contentWidth()
-	vpH := maxInt(m.height-statusH-composerH, 1)
+	pendingH := len(m.pendingRows(m.pendingMaxRows()))
+	vpH := maxInt(m.height-statusBarH-composerH-pendingH, 1)
 	m.conv.height = vpH
 	m.textarea.SetWidth(maxInt(contentW-8, 20))
 	m.textarea.SetHeight(composerH - 2)
@@ -1900,12 +1948,15 @@ func (m Model) View() string {
 	cv := m.conv.view()
 	m.stats.addViewPart(viewPartConv, time.Since(t0))
 	t0 = time.Now()
+	// The pending region sits between the conversation (whose live slot is the
+	// "current activity") and the composer — see frame.
+	pending := m.pendingBlock()
 	comp := m.composer()
 	m.stats.addViewPart(viewPartComposer, time.Since(t0))
 	t0 = time.Now()
 	st := m.statusLine()
 	m.stats.addViewPart(viewPartStatus, time.Since(t0))
-	return m.wrapFrame(m.joinFrame(cv, comp, st))
+	return m.wrapFrame(m.joinFrame(m.frameParts(cv, pending, comp, st)))
 }
 
 // frame is the non-instrumented View() path.
@@ -1913,22 +1964,158 @@ func (m Model) frame() string {
 	if m.hero() {
 		return m.wrapFrame(strings.Join([]string{m.heroBlock(), m.statusLine()}, "\n"))
 	}
-	return m.wrapFrame(m.joinFrame(m.conv.view(), m.composer(), m.statusLine()))
+	return m.wrapFrame(m.joinFrame(m.frameParts(m.conv.view(), m.pendingBlock(), m.composer(), m.statusLine())))
 }
 
-// joinFrame stacks the conversation, composer and status sections. Left-
-// aligned frame stack. Do NOT use lipgloss.JoinVertical here: it splits every
-// block, re-measures the ANSI display width of EVERY line and re-pads the
-// whole frame to a common width on every call — O(frame) per keystroke
-// (~580µs of the ~600µs View on a desktop; ~90ms/frame on a Pi 1 per
-// GARESS_STATS, scaling with conversation size). Nothing in this layout needs
-// a shared width (all blocks are left-aligned and the terminal erases to
-// end-of-line when lines are repainted), so trailing padding is invisible.
-// strings.Join reproduces JoinVertical's line structure exactly (an empty
-// block still contributes one blank line, matching strings.Split("", "\n"))
-// without any width math.
-func (m Model) joinFrame(cv, comp, st string) string {
-	return strings.Join([]string{cv, comp, st}, "\n")
+// frameParts stacks the fixed regions of the chat view, top to bottom:
+// conversation (history + live "current activity" slot), the pinned pending
+// prompts, the composer and the status line. Empty regions are omitted so they
+// take no rows.
+func (m Model) frameParts(cv, pending, comp, st string) []string {
+	parts := []string{cv}
+	if pending != "" {
+		parts = append(parts, pending)
+	}
+	parts = append(parts, comp, st)
+	return parts
+}
+
+// joinFrame stacks frame parts. Left-aligned frame stack. Do NOT use
+// lipgloss.JoinVertical here: it splits every block, re-measures the ANSI
+// display width of EVERY line and re-pads the whole frame to a common width on
+// every call — O(frame) per keystroke (~580µs of the ~600µs View on a desktop;
+// ~90ms/frame on a Pi 1 per GARESS_STATS, scaling with conversation size).
+// Nothing in this layout needs a shared width (all blocks are left-aligned and
+// the terminal erases to end-of-line when lines are repainted), so trailing
+// padding is invisible. strings.Join reproduces JoinVertical's line structure
+// exactly (an empty block still contributes one blank line, matching
+// strings.Split("", "\n")) without any width math.
+func (m Model) joinFrame(parts []string) string {
+	return strings.Join(parts, "\n")
+}
+
+// --- pending prompts (type-ahead queue) ----------------------------------
+
+// pendingMaxRows bounds the pinned pending region so the conversation keeps at
+// least one visible row (the composer + status line always win the bottom of
+// the terminal). 0 means "draw nothing" on very short terminals.
+func (m Model) pendingMaxRows() int {
+	return maxInt(m.height-(statusBarH+composerH+1), 0)
+}
+
+// pendingBlock renders the queued prompts pinned between the conversation
+// (whose live slot is the current activity) and the composer, oldest (next to
+// be sent) first. Returns "" when nothing is queued. The row count here must
+// agree with layout() — both call pendingRows with pendingMaxRows.
+func (m Model) pendingBlock() string {
+	rows := m.pendingRows(m.pendingMaxRows())
+	if len(rows) == 0 {
+		return ""
+	}
+	return strings.Join(rows, "\n")
+}
+
+// pendingRows renders up to maxRows rows of queued prompts. Each prompt is a
+// dim "Pending" block on the user rail (it is the user's message, just not
+// sent yet), wrapped to the content width. At most pendingMaxShown prompts are
+// expanded; the rest collapse into a "+N more" row.
+func (m Model) pendingRows(maxRows int) []string {
+	q := m.queued
+	if len(q) == 0 || maxRows <= 0 {
+		return nil
+	}
+	bodyW := maxInt(m.contentWidth()-6, 10) // rail(2) + body indent(2) + margin(2)
+	countRow := func(n int) []string {
+		return []string{ui.userRail + ui.pendingBody.Render(fmt.Sprintf("%d pending", n))}
+	}
+	// A single block taller than maxRows (huge prompt on a short terminal)
+	// collapses to a one-line count so the region never exceeds maxRows.
+	if len(m.pendingPromptRows(q[0].text, bodyW)) > maxRows {
+		return countRow(len(q))
+	}
+	var rows []string
+	shown := 0
+	for i := 0; i < len(q) && i < pendingMaxShown; i++ {
+		block := m.pendingPromptRows(q[i].text, bodyW)
+		sep := 0
+		if len(rows) > 0 {
+			sep = 1 // blank line between pending blocks
+		}
+		if len(rows)+sep+len(block) > maxRows {
+			break // the next block would push past maxRows; stop at a boundary
+		}
+		if sep > 0 {
+			rows = append(rows, "")
+		}
+		rows = append(rows, block...)
+		shown = i + 1
+	}
+	if shown < len(q) {
+		more := fmt.Sprintf("+ %d more pending", len(q)-shown)
+		if len(rows)+2 <= maxRows {
+			rows = append(rows, "")
+			rows = append(rows, ui.userRail+ui.pendingBody.Render(more))
+		}
+	}
+	return rows
+}
+
+// pendingPromptRows renders one queued prompt as a pending block: a "Pending"
+// label row plus the wrapped prompt text, each row on the user rail.
+func (m Model) pendingPromptRows(text string, bodyW int) []string {
+	rows := []string{ui.userRail + ui.pendingLabel.Render("Pending")}
+	for _, l := range wrapPlain(text, bodyW) {
+		rows = append(rows, ui.userRail+ui.pendingBody.Render(l))
+	}
+	return rows
+}
+
+// wrapPlain wraps ANSI-free text to at most width display columns, preserving
+// existing newlines and hard-breaking words longer than a line. Blank lines in
+// the source are dropped (a compact preview is enough for the pending region).
+func wrapPlain(s string, width int) []string {
+	if width <= 0 {
+		if strings.TrimSpace(s) == "" {
+			return nil
+		}
+		return []string{s}
+	}
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		var cur []string
+		curW := 0
+		flush := func() {
+			if len(cur) > 0 {
+				out = append(out, strings.Join(cur, " "))
+				cur = nil
+				curW = 0
+			}
+		}
+		for _, w := range strings.Fields(para) {
+			wl := lipgloss.Width(w)
+			if wl > width {
+				// A single word longer than the line: hard-break it.
+				flush()
+				for runes := []rune(w); len(runes) > 0; {
+					n := min(width, len(runes))
+					out = append(out, string(runes[:n]))
+					runes = runes[n:]
+				}
+				continue
+			}
+			if curW > 0 && curW+1+wl > width {
+				flush()
+			}
+			if len(cur) > 0 {
+				curW += 1 + wl
+			} else {
+				curW = wl
+			}
+			cur = append(cur, w)
+		}
+		flush()
+	}
+	return out
 }
 
 // composer renders the editor panel for the conversation view: the textarea
@@ -2045,8 +2232,8 @@ func (m Model) statusLine() string {
 		line = ui.confirm.Render("⚠ " + m.confirmPrompt + "  (y approve · n deny)")
 	case m.streaming:
 		verb := m.streamVerb() + "  (esc to stop)"
-		if m.queuedContent != nil {
-			verb += " · next prompt queued"
+		if n := len(m.queued); n > 0 {
+			verb += fmt.Sprintf(" · %d queued", n)
 		}
 		line = ui.streaming.Render(spinnerFrames[m.spinnerIdx] + " " + verb)
 	case m.err != "":

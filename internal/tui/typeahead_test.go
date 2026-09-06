@@ -65,7 +65,7 @@ func TestComposerEditsWhileStreaming(t *testing.T) {
 	if !m.streaming {
 		t.Error("typing must not end the streaming run")
 	}
-	if m.queuedContent != nil {
+	if len(m.queued) != 0 {
 		t.Error("mere typing must not queue anything")
 	}
 }
@@ -76,8 +76,8 @@ func TestEnterWhileStreamingQueuesPrompt(t *testing.T) {
 	m := busyTypingModel(t)
 	m = typeKeys(m, "next question")
 	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.queuedContent == nil || m.queuedText != "next question" {
-		t.Fatalf("queued = (%v, %q), want the drafted prompt", m.queuedContent != nil, m.queuedText)
+	if got := queueTexts(m); !reflect.DeepEqual(got, []string{"next question"}) {
+		t.Fatalf("queued = %v, want one drafted prompt", got)
 	}
 	if got := m.textarea.Value(); got != "" {
 		t.Errorf("composer should clear on queue, got %q", got)
@@ -92,12 +92,12 @@ func TestEnterWhileStreamingQueuesPrompt(t *testing.T) {
 func TestEnterWhileStreamingIgnoresEmptyAndCommands(t *testing.T) {
 	m := busyTypingModel(t)
 	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.queuedContent != nil {
+	if len(m.queued) != 0 {
 		t.Error("empty composer must not queue a prompt")
 	}
 	m = typeKeys(m, "/notes list")
 	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.queuedContent != nil {
+	if len(m.queued) != 0 {
 		t.Error("command text must not queue while streaming")
 	}
 	if got := m.textarea.Value(); got != "/notes list" {
@@ -105,20 +105,22 @@ func TestEnterWhileStreamingIgnoresEmptyAndCommands(t *testing.T) {
 	}
 }
 
-// TestEnterWhileStreamingKeepsDraftWhenAlreadyQueued: a second Enter while a
-// prompt is already queued must not silently overwrite the first — the new
-// draft stays in the composer.
-func TestEnterWhileStreamingKeepsDraftWhenAlreadyQueued(t *testing.T) {
+// TestEnterWhileStreamingQueuesMultipleInOrder: repeated Enters during a run
+// append prompts to the queue in submission order (FIFO — each will send one
+// per finished turn).
+func TestEnterWhileStreamingQueuesMultipleInOrder(t *testing.T) {
 	m := busyTypingModel(t)
 	m = typeKeys(m, "first")
 	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
 	m = typeKeys(m, "second")
 	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.queuedText != "first" {
-		t.Errorf("queued text = %q, want the first prompt kept", m.queuedText)
+	m = typeKeys(m, "third")
+	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if got := queueTexts(m); !reflect.DeepEqual(got, []string{"first", "second", "third"}) {
+		t.Errorf("queued order = %v, want submission order", got)
 	}
-	if got := m.textarea.Value(); got != "second" {
-		t.Errorf("second draft should stay in the composer, got %q", got)
+	if got := m.textarea.Value(); got != "" {
+		t.Errorf("composer should clear after each queue, got %q", got)
 	}
 }
 
@@ -142,8 +144,10 @@ func TestStatusLineShowsQueuedHint(t *testing.T) {
 	m := busyTypingModel(t)
 	m = typeKeys(m, "next")
 	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if got := m.statusLine(); !strings.Contains(got, "queued") {
-		t.Errorf("status line while a prompt is queued = %q, want a queued hint", got)
+	m = typeKeys(m, "later")
+	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if got := m.statusLine(); !strings.Contains(got, "2 queued") {
+		t.Errorf("status line while two prompts are queued = %q, want a count hint", got)
 	}
 }
 
@@ -214,8 +218,8 @@ func TestTypeAheadQueuedPromptAutoSends(t *testing.T) {
 	if !reflect.DeepEqual(texts, want) {
 		t.Errorf("persisted texts = %v, want %v", texts, want)
 	}
-	if final.queuedContent != nil || final.queuedText != "" {
-		t.Error("queued prompt should be consumed after auto-send")
+	if len(final.queued) != 0 {
+		t.Errorf("queue should be consumed after auto-send, still has %v", queueTexts(&final))
 	}
 	if got := final.textarea.Value(); got != "" {
 		t.Errorf("composer should be empty after the auto-sent prompt, got %q", got)
@@ -262,7 +266,140 @@ func TestTypeAheadPromptRestoredOnCancel(t *testing.T) {
 	if got := final.textarea.Value(); got != "two" {
 		t.Errorf("queued text should be restored to the composer on cancel, got %q", got)
 	}
-	if final.queuedContent != nil || final.queuedText != "" {
-		t.Error("queued prompt should be cleared once restored")
+	if len(final.queued) != 0 {
+		t.Errorf("queue should be cleared once restored, still has %v", queueTexts(&final))
+	}
+}
+
+// queueTexts returns the queued prompt texts in submission order (helper).
+func queueTexts(m *Model) []string {
+	out := make([]string, 0, len(m.queued))
+	for _, q := range m.queued {
+		out = append(out, q.text)
+	}
+	return out
+}
+
+// TestRestoreQueuedToComposerJoinsInOrder: handing the queue back after an
+// interrupt returns every prompt (in order) to the composer so nothing is
+// lost, and clears the queue.
+func TestRestoreQueuedToComposerJoinsInOrder(t *testing.T) {
+	m := busyTypingModel(t)
+	m.queued = []queuedPrompt{{text: "first"}, {text: "second"}, {text: "third"}}
+	m.restoreQueuedToComposer()
+	if len(m.queued) != 0 {
+		t.Error("queue should clear on restore")
+	}
+	if got := m.textarea.Value(); got != "first\nsecond\nthird" {
+		t.Errorf("composer after restore = %q, want all prompts in order", got)
+	}
+}
+
+// TestPendingPromptsRenderInSubmissionOrder: queued prompts render as "Pending"
+// blocks (oldest first) in the pinned region between the conversation and the
+// composer, and the conversation viewport shrinks to make room for them.
+func TestPendingPromptsRenderInSubmissionOrder(t *testing.T) {
+	m := busyTypingModel(t)
+	before := m.conv.height
+	m = typeKeys(m, "first prompt")
+	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = typeKeys(m, "second prompt")
+	m = keyModel(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if got := queueTexts(m); !reflect.DeepEqual(got, []string{"first prompt", "second prompt"}) {
+		t.Fatalf("queued order = %v", got)
+	}
+	block := m.pendingBlock()
+	if block == "" {
+		t.Fatal("pendingBlock empty with two queued prompts")
+	}
+	if !strings.Contains(block, "Pending") {
+		t.Errorf("pending block should be labelled Pending:\n%s", block)
+	}
+	iFirst := strings.Index(block, "first prompt")
+	iSecond := strings.Index(block, "second prompt")
+	if iFirst < 0 || iSecond < 0 || iFirst > iSecond {
+		t.Errorf("pending block should list prompts in submission order:\n%s", block)
+	}
+	// The conversation viewport gave up rows for the pinned pending region.
+	if m.conv.height >= before {
+		t.Errorf("conv height = %d, want < %d with a pending region", m.conv.height, before)
+	}
+	// With conversation content the pending region renders below it and above
+	// the composer, and the whole frame still fills the terminal exactly.
+	m.conv.appendStableZ("hello", zoneUser)
+	m.conv.gotoBottom()
+	frame := m.frame()
+	iConv := strings.Index(frame, "hello")
+	iPending := strings.Index(frame, "first prompt")
+	iComp := strings.Index(frame, "Message garess…")
+	if iConv < 0 || iPending < 0 || iComp < 0 || iConv > iPending || iPending > iComp {
+		t.Errorf("frame order should be conversation < pending < composer:\n%s", frame)
+	}
+	if got := len(strings.Split(frame, "\n")); got != m.height {
+		t.Errorf("frame rows = %d, want %d", got, m.height)
+	}
+	// An empty queue renders nothing and restores the viewport height.
+	m.queued = nil
+	m.layout()
+	if got := m.pendingBlock(); got != "" {
+		t.Errorf("pendingBlock should be empty with no queue, got %q", got)
+	}
+	if m.conv.height != before {
+		t.Errorf("conv height after clearing queue = %d, want %d", m.conv.height, before)
+	}
+}
+
+// TestPendingPromptsRenderEmptyWithoutQueue: with nothing queued the pending
+// region adds no rows at all.
+func TestPendingPromptsRenderEmptyWithoutQueue(t *testing.T) {
+	m := busyTypingModel(t)
+	if got := m.pendingBlock(); got != "" {
+		t.Errorf("pendingBlock with no queue = %q, want empty", got)
+	}
+	if len(m.pendingRows(m.pendingMaxRows())) != 0 {
+		t.Error("pendingRows with no queue should be empty")
+	}
+}
+
+// TestTypeAheadMultipleQueuedPromptsSendOnePerTurn: prompts queued while a run
+// is busy each auto-send, one per finished turn, in submission order — with no
+// further keypresses.
+func TestTypeAheadMultipleQueuedPromptsSendOnePerTurn(t *testing.T) {
+	env := newEnv(t)
+	sm := &typeAheadModel{name: "fake", replies: []string{"reply one", "reply two", "reply three"}, hold: 500 * time.Millisecond}
+	m := newModel(t, env, tools.Policy{}, sm)
+
+	final := run(t, m, func(prog *tea.Program) {
+		typeText(prog, "one")
+		prog.Send(tea.KeyMsg{Type: tea.KeyEnter})
+		time.Sleep(120 * time.Millisecond)
+		typeText(prog, "two")
+		prog.Send(tea.KeyMsg{Type: tea.KeyEnter})
+		typeText(prog, "three")
+		prog.Send(tea.KeyMsg{Type: tea.KeyEnter})
+		if evs := sessionEvents(t, env.svc, env.sessID); len(evs) > 1 {
+			t.Fatalf("turn 1 already finished before queueing (persisted=%d)", len(evs))
+		}
+		// No further input: each queued prompt must auto-send after the
+		// previous turn finishes.
+		waitFor(t, func() bool {
+			evs := sessionEvents(t, env.svc, env.sessID)
+			return len(evs) >= 6 && eventText(evs[len(evs)-1]) == "reply three"
+		})
+		drain()
+		prog.Send(tea.QuitMsg{})
+	})
+
+	texts := make([]string, 0)
+	for _, ev := range sessionEvents(t, env.svc, env.sessID) {
+		texts = append(texts, eventText(ev))
+	}
+	want := []string{"one", "reply one", "two", "reply two", "three", "reply three"}
+	if !reflect.DeepEqual(texts, want) {
+		t.Errorf("persisted texts = %v, want %v", texts, want)
+	}
+	if len(final.queued) != 0 {
+		t.Errorf("queue should be drained after all auto-sends, still has %v", queueTexts(&final))
 	}
 }

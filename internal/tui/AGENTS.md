@@ -254,15 +254,34 @@ of W` (`fmtCount` grouped numbers, `fmtPct` 1-decimal % under 10).
   keep their streaming meaning (esc/ctrl+c cancel, ctrl+t thinking, scroll
   keys scroll; `up`/`down` scroll only when the conversation overflows, else
   they move the composer cursor, same rule as idle). `enter` calls
-  `queueWhileBusy()`: it stores `m.queuedContent`/`m.queuedText` (one slot;
-  a second Enter keeps the draft in the composer instead of overwriting;
-  command lines are never queued) and clears the composer. `finishStreaming`
-  flushes the queue: on a clean finish the prompt is auto-sent via
-  `startStream` (riding a post-turn auto-compress as `pending`); when the run
-  was cancelled or failed, `queuedText` is restored to the composer instead —
-  never fire a follow-up run the user may not want. The status bar shows
-  "· next prompt queued" while a prompt is pending. Commands stay gated
-  mid-run (the palette re-arm is guarded by `!m.streaming`).
+  `queueWhileBusy()`: it appends to `m.queued` (a FIFO `[]queuedPrompt`, cap
+  `maxQueuedPrompts`; empty/command lines are never queued — command text
+  stays in the composer) and clears the composer.
+  `finishStreaming` pops the FRONT and auto-sends it via `startStream` on a
+  clean finish (riding a post-turn auto-compress as `pending`), so queued
+  prompts fire one per finished turn in submission order; remaining prompts
+  stay queued. When the run was cancelled or failed, `restoreQueuedToComposer`
+  returns the whole queue to the composer (newline-joined) instead of firing
+  runs the user may not want — nothing is lost. The queue survives a
+  confirmation round trip (finishStreaming's confirming early-return preserves
+  it). The status bar shows `· N queued` while prompts are pending. Commands
+  stay gated mid-run (the palette re-arm is guarded by `!m.streaming`).
+- **Pending region (rendered 2026-09-06).** Queued prompts render as dim
+  `Pending` blocks pinned between the conversation (whose live slot is the
+  "current activity") and the composer: `frameParts()` stacks
+  conv → pending → composer → status, and `joinFrame` takes a slice now.
+  Rendering is `pendingRows(maxRows)` (maxRows = `pendingMaxRows()` =
+  height − statusBarH − composerH − 1) — each prompt is a `Pending` label +
+  word-wrapped body on the user rail (blue, it is the user's message), blank
+  line between prompts, at most `pendingMaxShown` (3) expanded and the rest a
+  `+N more` row; a single block taller than maxRows collapses to a count row
+  so the region NEVER exceeds maxRows. `wrapPlain` does the wrapping (no
+  glamour — cheap per-frame). Layout must agree with rendering: `layout()`
+  computes `pendingH = len(pendingRows(pendingMaxRows()))` and shrinks
+  `conv.height` by it, so queue mutations (`queueWhileBusy`, the
+  `finishStreaming` flush/restore) call `layout()` + `updateViewport()`.
+  `statusBarH`/`composerH` are package consts. Styles: `ui.pendingLabel`
+  (italic dim) / `ui.pendingBody` (faint, PaddingLeft 2).
 
 ## Right session rail + resume (2026-09-05) — internal/tui/sessions.go
 
