@@ -1,5 +1,7 @@
 # garess
 
+[See it in action](https://github.com/user-attachments/assets/adcdeb3d-a0f8-461c-b31a-e35855f69bc4)
+
 A minimal AI harness for the terminal. It talks to any OpenAI-compatible
 `/v1/chat/completions` endpoint — local [llama.cpp], DeepSeek, OpenRouter, … —
 through a Claude-Code-style TUI with an agentic tool loop, project + global
