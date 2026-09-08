@@ -29,6 +29,25 @@ error)`; use `Preamble.Get` so `/agents reload` works without rebuilding.
   Hook abort semantics are exercised end-to-end in `harness_test.go`
   (`TestHookBeforeToolBlocksToolCall`, `TestHookBeforeRunAbortsRun`,
   `TestHookPassingStillRunsTool`) against the fake endpoint.
+- **Sub-agent personas (`run_subagent`).** `opts.Personas
+[]personas.Persona` (internal/personas, discovered by cmd/garess) enables
+  delegation: when at least one model-invocable persona exists, `Build`
+  appends a `run_subagent` function tool (name const `RunSubagentTool` in
+  internal/harness/subagent.go) to the main agent. `subagent.go`'s
+  `personaRuntime` builds/caches each persona as its own `llmagent` (model
+  override `persona.Model` on the same provider, tool allowlist via
+  `tools.BuildToolsFor`, instruction = base preamble + persona body, its own
+  iteration cap, `subagentGateCallback` for deny/ask) and runs it as a NESTED
+  ADK `runner.Run` against a fresh isolated session (`chat.NewSessionID()`),
+  consuming its events synchronously — validated by
+  `TestRunSubagentDelegatesAgenticLoop`. Sub-agents persist to their own JSONL
+  session. Nesting: a persona only gets `run_subagent` if its `tools:` lists
+  it (then gated by its `agents:` allowlist); depth is capped
+  (`MaxSubAgentDepth`, context-carried). `opts.SubAgentSink` (a func) receives
+  live `SubAgentStatus` updates (started/tool/event/finished/failed + inner
+  events + the invoking `CallID`) for top-level runs only; the TUI renders
+  them. Inner tools that policy marks ASK fail closed (denied) — nested runs
+  cannot answer HITL.
 - Tests (`harness_test.go`) drive the full loop against an `httptest` fake
   endpoint: text, tool call → execute → feed back, and the HITL confirmation
   two-`Run` round trip.

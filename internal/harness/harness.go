@@ -20,6 +20,7 @@ import (
 	"garess/internal/llm"
 	"garess/internal/mcp"
 	"garess/internal/memory"
+	"garess/internal/personas"
 	"garess/internal/tools"
 )
 
@@ -72,6 +73,13 @@ type Options struct {
 	// Model, when set, overrides the model built from the provider config
 	// (used by tests with a scripted model).
 	Model model.LLM
+	// Personas are custom-agent definitions (internal/personas) the main
+	// agent can run as sub-agents via the run_subagent tool. Empty disables
+	// the feature (no tool is registered).
+	Personas []personas.Persona
+	// SubAgentSink receives live status updates from running sub-agents so
+	// the TUI can render them. Nil means no observer.
+	SubAgentSink SubAgentSink
 }
 
 // Build constructs the ADK agent and runner for a configured provider.
@@ -91,6 +99,22 @@ func Build(pc config.Provider, opts Options) (*Provider, error) {
 		return nil, fmt.Errorf("harness: build tools: %w", err)
 	}
 
+	// Optional custom-agent personas: when at least one model-invocable
+	// persona is registered, a run_subagent tool is appended to the main
+	// agent's toolset so it can delegate focused work to them.
+	if len(opts.Personas) > 0 {
+		rt, err := newPersonaRuntime(pc, m, opts, opts.Personas)
+		if err != nil {
+			return nil, fmt.Errorf("harness: personas: %w", err)
+		}
+		if rt != nil {
+			subTool, err := rt.buildRunSubagentTool(nil, true)
+			if err != nil {
+				return nil, fmt.Errorf("harness: run_subagent tool: %w", err)
+			}
+			builtinTools = append(builtinTools, subTool)
+		}
+	}
 	// Optional MCP servers: each becomes an ADK toolset whose tools ride the
 	// same deny/ask policy as the built-ins (see internal/mcp). Empty config
 	// means no toolsets, so there is zero per-run overhead.

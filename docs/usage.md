@@ -17,6 +17,7 @@ covered in the [Safety model](safety.md).
 | `tab`                              | focus the session list in the right rail (wide terminals); `↑↓` picks, `enter` resumes, `esc` back |
 | type `/`                           | open the slash-command palette                                                                     |
 | `ctrl+t`                           | show / hide the model's thinking (reasoning). Thinking is captured and stored, hidden by default   |
+| `ctrl+o`                           | expand / collapse delegated sub-agent blocks (see [Custom agents](custom-agents.md))               |
 | `esc`                              | stop the current response (or deny a pending confirmation)                                         |
 | `ctrl+c`                           | quit                                                                                               |
 | `y` / `n`                          | approve / deny a tool call that asks for confirmation                                              |
@@ -137,10 +138,30 @@ Skills are the same idea, packaged per-topic. They are discovered from
 `.garess/skills/<name>/SKILL.md` (project), or the repo-local
 `<launchdir>/skills/<name>/SKILL.md`. A skill directory may also use
 `README.md` instead of `SKILL.md`. Skills support the same `@import` and
-`{{VAR}}` expansion.
+`{{VAR}}` expansion. A skill file may start with a YAML frontmatter block
+(`name`, `description`): garess parses it with `yaml`, shows the description,
+and strips the block — unknown keys never reach the model.
 
 `/agents`, `/agents reload`, `/skills`, and `/skills reload` let you inspect
 and refresh these without restarting.
+
+## Custom agents and sub-agents
+
+Custom agents are specialized personas — Markdown files with YAML frontmatter
+(`name`, `description`, `tools`, …) discovered from
+`~/.config/garess/agents/*.md` (user) and `<launch dir>/.garess/agents/*.md`
+or `<launch dir>/agents/*.md` (project). The main agent can delegate a focused
+subtask to one of them with its `run_subagent` tool; the sub-agent runs with
+its own context, tools and instructions and reports a final result back.
+
+While a sub-agent runs you see a live, collapsed row with its name and current
+tool (`▸ researcher · running grep …`). When it finishes, a block stays in the
+conversation between the ⚙ `run_subagent` tool call and its result — press
+`ctrl+o` to expand it to the task, the sub-agent's tool calls and its final
+result. `garess doctor` lists the personas in scope.
+
+See [Custom agents & sub-agents](custom-agents.md) for the full file format,
+frontmatter fields, and safety notes.
 
 ## Multiple providers
 

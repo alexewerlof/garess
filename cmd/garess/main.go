@@ -27,6 +27,7 @@ import (
 	"garess/internal/llm"
 	"garess/internal/mcp"
 	"garess/internal/memory"
+	"garess/internal/personas"
 	"garess/internal/sandbox"
 	"garess/internal/skills"
 	"garess/internal/tools"
@@ -243,6 +244,30 @@ func runTUI(cfgPath, providerName, modelName string) error {
 		MCPServers:     cfg.MCPServers,
 		Preamble:       preamble.Get,
 	}
+
+	// Custom-agent personas (run_subagent): discovered from the working
+	// directory (capped at launch, like AGENTS.md) and the user config dir.
+	// When any model-invocable persona exists, each provider's main agent gets
+	// a run_subagent tool and a live status channel feeds the TUI's collapsible
+	// sub-agent blocks.
+	var personasList []personas.Persona
+	if ps, perr := personas.Discover(wd); perr != nil {
+		slog.Warn("personas: discovery failed", "err", perr)
+	} else {
+		personasList = ps
+	}
+	var subAgentEvents chan harness.SubAgentStatus
+	if len(personasList) > 0 {
+		// Buffered: the TUI drains it continuously while a run is in flight.
+		subAgentEvents = make(chan harness.SubAgentStatus, 256)
+	}
+	opts.Personas = personasList
+	opts.SubAgentSink = func(st harness.SubAgentStatus) {
+		if subAgentEvents != nil {
+			subAgentEvents <- st
+		}
+	}
+
 	providers := make(map[string]*harness.Provider, len(cfg.Providers))
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
@@ -282,6 +307,7 @@ func runTUI(cfgPath, providerName, modelName string) error {
 		ContextWindows:  resolveContextWindows(cfg),
 		Version:         version,
 		SessionService:  svc, // right session rail + /sessions resume
+		SubAgentEvents:  subAgentEvents,
 	})
 	if err != nil {
 		return err
@@ -413,6 +439,7 @@ func runDoctor(args []string) error {
 	reportContext(cfg)
 	reportAgents()
 	reportSkills()
+	reportPersonas()
 	return nil
 }
 
@@ -569,5 +596,35 @@ func reportSkills() {
 	fmt.Println("skills:")
 	for _, s := range sources {
 		fmt.Printf("  - %s (%s · %s)\n", s.Path, s.Name, s.Scope)
+	}
+}
+
+// reportPersonas lists the custom-agent personas (run_subagent targets) that
+// apply to the working directory, marking which are model-invocable.
+func reportPersonas() {
+	wd, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	personasList, err := personas.Discover(wd)
+	if err != nil {
+		fmt.Printf("personas:    error: %v\n", err)
+		return
+	}
+	if len(personasList) == 0 {
+		fmt.Println("personas:    no custom-agent files apply (.garess/agents or ~/.config/garess/agents)")
+		return
+	}
+	fmt.Println("personas:")
+	for _, p := range personasList {
+		invoc := ""
+		if !p.ModelInvocable() {
+			invoc = " · not model-invocable"
+		}
+		desc := p.Description
+		if desc == "" {
+			desc = "(no description)"
+		}
+		fmt.Printf("  - %s: %s (%s · %s)%s\n", p.Name, desc, p.Path, p.Scope, invoc)
 	}
 }

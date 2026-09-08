@@ -35,20 +35,21 @@ Finish changes with `go build ./... && go test ./...`; keep `gofmt` clean
 
 ## Layout
 
-| Path                | Purpose                                                                               |
-| ------------------- | ------------------------------------------------------------------------------------- |
-| `cmd/garess/`       | Entry point, flags, subcommands (`init`, `doctor`, `help`), friendly config errors    |
-| `internal/agents/`  | AGENTS.md + SYSTEM.md discovery + rendering (`@import` imports, env-var substitution) |
-| `internal/chat/`    | Sessions + JSONL transcripts (`.garess/sessions/`)                                    |
-| `internal/config/`  | TOML config, XDG paths, merge, typed errors, embedded example template (`Example()`)  |
-| `internal/harness/` | ADK agent + runner wiring (tools, policy, hooks plugin)                               |
-| `internal/hooks/`   | Git-style shell hooks (config `[[hooks]]`, ADK plugin, exit-code abort)               |
-| `internal/llm/`     | Custom ADK `model.LLM` over OpenAI-compatible chat completions (no SDK)               |
-| `internal/mcp/`     | MCP server client: `[[mcp_servers]]` config → ADK toolsets (stdio/sse/http, auth)     |
-| `internal/memory/`  | Local + global memory notes                                                           |
-| `internal/sandbox/` | Landlock tool sandbox (Phase 4): write confinement, none/auto/landlock backends       |
-| `internal/skills/`  | Skill pack discovery + rendering (user/project/launch-dir roots)                      |
-| `internal/tui/`     | Bubble Tea UI (model, streaming, markdown, commands)                                  |
+| Path                 | Purpose                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------- |
+| `cmd/garess/`        | Entry point, flags, subcommands (`init`, `doctor`, `help`), friendly config errors    |
+| `internal/agents/`   | AGENTS.md + SYSTEM.md discovery + rendering (`@import` imports, env-var substitution) |
+| `internal/chat/`     | Sessions + JSONL transcripts (`.garess/sessions/`)                                    |
+| `internal/config/`   | TOML config, XDG paths, merge, typed errors, embedded example template (`Example()`)  |
+| `internal/harness/`  | ADK agent + runner wiring (tools, policy, hooks plugin)                               |
+| `internal/hooks/`    | Git-style shell hooks (config `[[hooks]]`, ADK plugin, exit-code abort)               |
+| `internal/llm/`      | Custom ADK `model.LLM` over OpenAI-compatible chat completions (no SDK)               |
+| `internal/mcp/`      | MCP server client: `[[mcp_servers]]` config → ADK toolsets (stdio/sse/http, auth)     |
+| `internal/memory/`   | Local + global memory notes                                                           |
+| `internal/personas/` | Custom-agent definitions (YAML-frontmatter .md): run_subagent sub-agent targets       |
+| `internal/sandbox/`  | Landlock tool sandbox (Phase 4): write confinement, none/auto/landlock backends       |
+| `internal/skills/`   | Skill pack discovery + rendering (user/project/launch-dir roots)                      |
+| `internal/tui/`      | Bubble Tea UI (model, streaming, markdown, commands)                                  |
 
 Each package has its own `AGENTS.md` with its specific conventions — read the
 one in the folder you are editing.
@@ -63,7 +64,8 @@ one in the folder you are editing.
 - `google.golang.org/adk/v2` v2.2.0 (agent runner, tools, plugins, session
   types) + `google.golang.org/genai` (content types). The chat-completions
   wire format is hand-rolled in `internal/llm` — no OpenAI SDK dependency.
-- `BurntSushi/toml` (config).
+- `BurntSushi/toml` (config) + `gopkg.in/yaml.v3` (custom-agent / skill
+  frontmatter).
 
 ## Conventions & gotchas
 
@@ -259,3 +261,31 @@ the `tui.theme` dark/light automatically — no new config):
   math per visible line; the editor panel's `Width` pass is bounded to its 4
   rows. Validate on the Pi at 118 cols with GARESS_STATS (rail stays off
   there).
+
+## Custom agents & sub-agents (2026-09-07)
+
+VS Code-style custom agents and delegated sub-agents:
+
+- **Persona files** (`internal/personas`): Markdown + YAML frontmatter
+  (`name`, `description`, `tools` list-or-comma-string, `model`, `user-invocable`
+  [parsed, unused this milestone], `disable-model-invocation`, `agents`
+  allowlist, `argument-hint`; body = instructions). Roots: user
+  `~/.config/garess/agents/*.md`; project `<launchdir>/.garess/agents/*.md`
+  - `<launchdir>/agents/*.md` (project overrides user by name; launch-dir cap
+    like AGENTS.md). Frontmatter parsed via `gopkg.in/yaml.v3` and STRIPPED —
+    unknown keys never reach the model. SKILL.md files get the same treatment
+    now (name/description kept, frontmatter stripped).
+- **run_subagent tool** (`internal/harness/subagent.go`): the main agent can
+  delegate to a model-invocable persona; the persona runs as its own ADK
+  runner (own `llmagent`: model override on the same provider, tool allowlist,
+  base-preamble+body instruction, iteration cap, deny/ask gate) on a FRESH
+  isolated `.garess/sessions/` JSONL session. Nested `runner.Run` inside the
+  tool handler is validated (TestRunSubagentDelegatesAgenticLoop). Inner ASK
+  fails closed (denied); sub-agents only get run_subagent when their `tools:`
+  lists it; nesting depth cap 5. Policy wiring in cmd/garess: discover at
+  startup → `harness.Options.Personas` + a status channel.
+- **TUI** (`internal/tui/subagents.go`): a running sub-agent shows a live
+  `▸ <agent> · running <tool> …` row; on completion a collapsible block is
+  anchored between ⚙ run_subagent and ↳ result — collapsed by default,
+  `ctrl+o` expands to the prompt, inner tool calls/results, and final result.
+  `garess doctor` lists personas (`reportPersonas`).

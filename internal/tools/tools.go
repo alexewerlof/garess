@@ -38,7 +38,17 @@ func BuiltinNames() []string {
 // blocked by DenyCallback.
 func BuildTools(mem *memory.Store, workDir string, policy Policy) ([]tool.Tool, error) {
 	b := &builder{mem: mem, workDir: workDir, policy: policy}
-	return b.build()
+	return b.buildFor(nil, true)
+}
+
+// BuildToolsFor constructs the built-in tools whose names are listed (nil or
+// empty = all built-ins) WITHOUT binding ask rules to HITL confirmation: the
+// tools carry no RequireConfirmationProvider. Callers that cannot answer a
+// HITL round trip — sub-agent personas (internal/harness) — must deny asks in
+// a BeforeToolCallback instead. Unknown names are ignored.
+func BuildToolsFor(mem *memory.Store, workDir string, policy Policy, names []string) ([]tool.Tool, error) {
+	b := &builder{mem: mem, workDir: workDir, policy: policy}
+	return b.buildFor(names, false)
 }
 
 // DenyCallback returns an llmagent.BeforeToolCallback that blocks tool calls
@@ -73,6 +83,13 @@ func askProvider[TArgs any](policy Policy, name string) func(TArgs) bool {
 	}
 }
 
+// AskProvider returns the RequireConfirmationProvider for a tool built outside
+// this package (e.g. run_subagent in internal/harness): it asks exactly when
+// the policy decision for the call is ApprovalAsk.
+func AskProvider[TArgs any](policy Policy, name string) func(TArgs) bool {
+	return askProvider[TArgs](policy, name)
+}
+
 type builder struct {
 	mem     *memory.Store
 	workDir string
@@ -89,43 +106,70 @@ func toolConfig[TArgs any](policy Policy, name, desc string) functiontool.Config
 	}
 }
 
-func (b *builder) build() ([]tool.Tool, error) {
+// buildFor constructs built-in tools. names == nil or empty selects all
+// built-ins; otherwise only the listed names are returned. bindAsk=true wires
+// the ask policy to ADK HITL confirmation (RequireConfirmationProvider);
+// bindAsk=false leaves no confirmation provider so callers that cannot answer
+// confirmations (sub-agent personas) must deny asks themselves.
+func (b *builder) buildFor(names []string, bindAsk bool) ([]tool.Tool, error) {
+	want := map[string]bool{}
+	for _, n := range names {
+		want[n] = true
+	}
+	pick := func(name string) bool { return len(want) == 0 || want[name] }
 	var out []tool.Tool
 	add := func(t tool.Tool, err error) error {
 		if err != nil {
 			return err
 		}
-		out = append(out, t)
+		if t != nil {
+			out = append(out, t)
+		}
 		return nil
 	}
-	if err := add(functiontool.New(toolConfig[BashInput](b.policy, "bash", "Run a shell command with `bash -lc`. Returns combined stdout and stderr."), b.bash)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "bash", "Run a shell command with `bash -lc`. Returns combined stdout and stderr.", b.bash)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[ReadFileInput](b.policy, "read_file", "Read a file and return its contents."), b.readFile)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "read_file", "Read a file and return its contents.", b.readFile)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[WriteFileInput](b.policy, "write_file", "Write content to a file, creating parent directories as needed."), b.writeFile)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "write_file", "Write content to a file, creating parent directories as needed.", b.writeFile)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[GlobInput](b.policy, "glob", "Expand a glob pattern (e.g. **/*.go) to matching paths."), b.glob)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "glob", "Expand a glob pattern (e.g. **/*.go) to matching paths.", b.glob)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[GrepInput](b.policy, "grep", "Search a file or directory tree for lines matching a regular expression."), b.grep)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "grep", "Search a file or directory tree for lines matching a regular expression.", b.grep)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[MemoryReadInput](b.policy, "memory_read", "Read a local (project) or global memory note."), b.memoryRead)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "memory_read", "Read a local (project) or global memory note.", b.memoryRead)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[MemoryWriteInput](b.policy, "memory_write", "Save a memory note. Local scope by default; set global=true for the user-wide scope."), b.memoryWrite)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "memory_write", "Save a memory note. Local scope by default; set global=true for the user-wide scope.", b.memoryWrite)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[MemoryListInput](b.policy, "memory_list", "List memory notes in the local (project) or global scope."), b.memoryList)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "memory_list", "List memory notes in the local (project) or global scope.", b.memoryList)); err != nil {
 		return nil, err
 	}
-	if err := add(functiontool.New(toolConfig[MemoryDeleteInput](b.policy, "memory_delete", "Delete a memory note from the local or global scope."), b.memoryDelete)); err != nil {
+	if err := add(registerIf(b.policy, pick, bindAsk, "memory_delete", "Delete a memory note from the local or global scope.", b.memoryDelete)); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// registerIf builds one built-in tool when pick(name) selects it, else nil.
+// bindAsk=true binds the ask policy to HITL confirmation.
+func registerIf[TArgs any](policy Policy, pick func(string) bool, bindAsk bool, name, desc string, h func(agent.Context, TArgs) (map[string]any, error)) (tool.Tool, error) {
+	if !pick(name) {
+		return nil, nil
+	}
+	var c functiontool.Config
+	if bindAsk {
+		c = toolConfig[TArgs](policy, name, desc)
+	} else {
+		c = functiontool.Config{Name: name, Description: desc}
+	}
+	return functiontool.New(c, h)
 }
 
 // output wraps a tool result for the model as a JSON object.

@@ -282,6 +282,7 @@ func (m Model) resumeSession(id string) (tea.Model, tea.Cmd) {
 	m.compressIsAuto = false
 	m.ctxUsageThisRun = false
 	m.ctxLastPrompt = 0
+	m.clearSubagents()                   // sub-agent blocks belonged to the previous session's events
 	m.ctxEst = m.estimatedPromptTokens() // an estimate until the next model call anchors it
 	m.textarea.Reset()
 	m.reconcileComposerCursor() // the composer is empty again

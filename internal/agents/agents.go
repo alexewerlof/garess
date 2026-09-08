@@ -111,6 +111,13 @@ func Render(path string) (string, error) {
 	return render(path, nil, 0)
 }
 
+// RenderText expands @import lines and {{VAR}} placeholders in arbitrary
+// markdown text, resolving imports relative to baseDir. Instruction files and
+// custom-agent (persona) bodies share the same rendering engine.
+func RenderText(text, baseDir string) (string, error) {
+	return expandText(text, baseDir, nil, 0)
+}
+
 func render(path string, seen map[string]bool, depth int) (string, error) {
 	if depth > 8 {
 		return "", fmt.Errorf("too many nested imports at %s", path)
@@ -131,15 +138,24 @@ func render(path string, seen map[string]bool, depth int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return expandText(string(b), filepath.Dir(abs), seen, depth)
+}
+
+// expandText processes one text block (a file body or a persona body),
+// expanding @import whole lines relative to baseDir (globs supported) and
+// {{VAR}} environment placeholders. Imports recurse through render, so cycle
+// detection and the depth cap apply across file boundaries; depth is the
+// current file-import depth of the block.
+func expandText(text, baseDir string, seen map[string]bool, depth int) (string, error) {
 	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
+	for _, line := range strings.Split(text, "\n") {
 		if target, ok := importTarget(line); ok {
-			matches, err := filepath.Glob(filepath.Join(filepath.Dir(abs), target))
+			matches, err := filepath.Glob(filepath.Join(baseDir, target))
 			if err != nil {
-				return "", fmt.Errorf("%s: bad import %q: %v", abs, target, err)
+				return "", fmt.Errorf("%s: bad import %q: %v", baseDir, target, err)
 			}
 			if len(matches) == 0 {
-				return "", fmt.Errorf("%s: import %q matches no files", abs, target)
+				return "", fmt.Errorf("%s: import %q matches no files", baseDir, target)
 			}
 			sort.Strings(matches)
 			for _, m := range matches {

@@ -60,7 +60,7 @@ type Model struct {
 	agentsText    string
 	agentsSources []agents.Source
 	skillsText    string
-	skillsSources []skills.Source
+	skillsSources []skills.Skill
 	workDir       string
 
 	width  int
@@ -142,6 +142,13 @@ type Model struct {
 	sessionsSel  int    // highlighted entry in the rail / picker
 	sessionsShow bool   // /sessions picker is open (conv live slot)
 	railFocused  bool   // arrow keys drive the right rail list
+
+	// Sub-agent delegation (run_subagent): subCh carries the live status
+	// stream from the harness sink; subs holds per-run display records;
+	// subOpen expands/collapses their blocks (ctrl+o).
+	subCh   <-chan harness.SubAgentStatus
+	subs    []*subAgentRecord
+	subOpen bool
 }
 
 // adkEvent carries one pumped runner event.
@@ -234,6 +241,7 @@ func New(providers map[string]*harness.Provider, current, theme, userID, session
 		ctxApprox:       cur.approx,
 		autoCompress:    autoCompress,
 		autoCompressPct: autoPct,
+		subCh:           o.SubAgentEvents,
 	}
 	if statsEnabled() {
 		m.stats = newTUIStats()
@@ -260,6 +268,9 @@ func (m Model) Init() tea.Cmd {
 	if cmd := m.loadSessions(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
+	if m.subCh != nil {
+		cmds = append(cmds, waitSubAgent(m.subCh))
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -282,10 +293,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinnerTickMsg:
 		m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
 		if m.streaming || m.compressing {
-			if m.compressing || (m.streaming && m.generationPending) {
+			if m.compressing || (m.streaming && m.generationPending) || m.subRunning() {
 				// Animate in-conversation indicators: the compression
-				// progress, and the live "Thinking" placeholder while we wait
-				// for the first deltas of a model generation.
+				// progress, the live "Thinking" placeholder while we wait
+				// for the first deltas of a model generation, and the live
+				// sub-agent row while it runs.
 				m.updateViewport()
 			}
 			return m, tea.Tick(spinnerInterval, func(time.Time) tea.Msg { return spinnerTickMsg{} })
@@ -300,6 +312,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionsMsg:
 		return m.handleSessions(msg)
+
+	case subAgentMsg:
+		return m.handleSubAgent(msg.st)
 
 	case tea.KeyMsg:
 		if m.stats != nil {
@@ -444,6 +459,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "ctrl+t":
 			return m.toggleThinking()
+		case "ctrl+o":
+			return m.toggleSubagents()
 		case "ctrl+j":
 			// Enter queues (see below), so ctrl+j is the newline key for a
 			// multi-line draft — same as the idle composer.
@@ -608,6 +625,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.reconcileComposerCursor()
 	case "ctrl+t":
 		return m.toggleThinking()
+	case "ctrl+o":
+		return m.toggleSubagents()
 	case "tab":
 		// Tab cycles focus to the right session rail when there is something
 		// to resume (desktop terminals only — the rail is inactive on narrow
@@ -1202,6 +1221,8 @@ func (m Model) newSession() (tea.Model, tea.Cmd) {
 	// The picker and rail focus describe the previous session; close them.
 	m.sessionsShow = false
 	m.railFocused = false
+	// Sub-agent blocks belong to the previous session's events.
+	m.clearSubagents()
 	m.layout() // the pending region (if any) changed with the queue
 	m.resetView()
 	m.status = "new session started"
@@ -1738,13 +1759,28 @@ func (m *Model) stableParts() []taggedPart {
 	if m.thinkingBlock != "" {
 		n++
 	}
-	parts := make([]taggedPart, 0, n)
+	parts := make([]taggedPart, 0, n+len(m.subs))
+	// Finished top-level sub-agent runs anchor their block to the ⚙ run_subagent
+	// function call that started them (keyed by its call id).
+	byCall := make(map[string]*subAgentRecord, len(m.subs))
+	for _, r := range m.subs {
+		if !r.running {
+			byCall[r.callID] = r
+		}
+	}
 	for i, r := range m.rendered {
 		var ev *session.Event
 		if i < len(m.events) {
 			ev = m.events[i]
 		}
 		parts = append(parts, taggedPart{text: r, zone: m.zoneForEvent(ev)})
+		if ev != nil {
+			if id := subCallID(ev); id != "" {
+				if rec := byCall[id]; rec != nil {
+					parts = append(parts, taggedPart{text: m.subBlock(rec) + "\n", zone: zonePlain})
+				}
+			}
+		}
 	}
 	if m.thinkingBlock != "" {
 		parts = append(parts, taggedPart{text: m.thinkingBlock, zone: zoneAssistant})
@@ -1857,6 +1893,10 @@ func (m *Model) updateViewport() {
 		m.conv.setLiveZ(m.thinkingIndicator(), zoneAssistant)
 	case m.assistantActive:
 		m.conv.setLiveZ(m.streamTail(), zoneAssistant)
+	case m.subRunning():
+		// A top-level sub-agent is running: its live row (agent + current
+		// tool) owns the live slot until the run finishes.
+		m.conv.setLive(m.subAgentLive())
 	case m.sessionsOpen():
 		// /sessions picker: the recent-session list in the live slot.
 		m.conv.setLive(m.sessionsBlock())

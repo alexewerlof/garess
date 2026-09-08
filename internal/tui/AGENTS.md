@@ -80,6 +80,20 @@ Key rules (each one caused a real bug):
      Rule of thumb: anything that makes lipgloss measure or pad an already-built
      block on every frame is O(frame) and will hurt on the Pi.
 
+- **Sub-agent blocks (run_subagent, ctrl+o).** When a top-level sub-agent
+  runs (harness `SubAgentSink` → `Options.SubAgentEvents` channel), the live
+  slot in `updateViewport` shows a dim `▸ <agent> · running <tool> …` row
+  (spinner ticks while `subRunning()`). On completion the run is anchored as a
+  collapsible block AFTER the ⚙ run_subagent event and BEFORE its ↳ result
+  (`stableParts` inserts it keyed by the FC call id from
+  `SubAgentStatus.CallID`). Collapsed by default (`▸ <agent>`); `ctrl+o`
+  (`toggleSubagents` → `subOpen`) expands to `▼ <agent>` plus the prompt, the
+  sub-agent's inner tool calls/results, and its final result — rendered from
+  inner `session.Event`s via `renderEventInner`, cached per record
+  (`subagents.go`, `subAgentRecord`). State resets on `/new` and resume.
+  With no channel the feature is off and run_subagent renders as a plain ⚙/↳
+  pair.
+
 - **HITL confirmation.** When a run yields an `adk_request_confirmation`
   FunctionCall, the run ends; `enterConfirmation` records the wrapper IDs and
   the TUI enters `m.confirming` (y/n prompt in the status line). `y`/`n`

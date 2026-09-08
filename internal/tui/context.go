@@ -47,6 +47,10 @@ type Options struct {
 	// SessionService lets the TUI list and resume past sessions (right rail
 	// and /sessions). nil hides those features.
 	SessionService session.Service
+	// SubAgentEvents receives live status updates from running sub-agents
+	// (the harness SubAgentSink writes into this channel). nil disables the
+	// sub-agent display (run_subagent calls render as plain ⚙/↳ blocks).
+	SubAgentEvents <-chan harness.SubAgentStatus
 }
 
 // windowInfo is the resolved context window for one provider.

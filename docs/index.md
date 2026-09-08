@@ -4,7 +4,8 @@
 and runs an agentic tool loop, with a TUI, memory, hooks, and a sandbox.
 
 - **End users** — [Getting started](getting-started.md) · [Using the TUI](usage.md)
-  · [Configuration](configuration.md) · [Safety model](safety.md)
+  · [Configuration](configuration.md) · [Custom agents & sub-agents](custom-agents.md)
+  · [Safety model](safety.md)
 - **Developers** — [Architecture](architecture.md) · [Development](development.md)
   · [Releasing](releasing.md)
 - **AI agents** — read the `AGENTS.md` files: the [repo root](../AGENTS.md)

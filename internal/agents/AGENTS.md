@@ -14,7 +14,9 @@ the harness's own instruction-file support.
 - **Rendering** (`Render(path)`): `@path/to/file` import lines must be the
   whole line (globs supported; cycles and missing files are errors; imports
   are relative to the file). Double-brace variables (e.g. a `VAR` placeholder)
-  expand from the environment.
+  expand from the environment. `RenderText(text, baseDir)` runs the same
+  expansion over inline text (skill and persona bodies use it; see
+  `frontmatter.go` for the shared `SplitFrontmatter` delimiter helper).
 - **Assembly** (`Build(dir)`): joins rendered sources with
   `## <BASENAME> (<scope> · <path>)` headers (AGENTS.md or SYSTEM.md).
 - Consumers: `internal/tui` (`/agents`, `/agents reload`) and `cmd/garess`

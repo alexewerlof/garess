@@ -89,6 +89,9 @@ type styles struct {
 	summaryHeader  lipgloss.Style
 	toolHeader     lipgloss.Style // "⚙ name"
 	toolBody       lipgloss.Style
+	// Sub-agent delegation blocks (run_subagent).
+	subagentHeader lipgloss.Style // "▸ name" / "▼ name"
+	subagentBody   lipgloss.Style
 	// Slash-command palette.
 	palItem lipgloss.Style
 	palDesc lipgloss.Style
@@ -158,6 +161,9 @@ func buildStyles(c colors) styles {
 		summaryHeader:  base.Bold(true).Foreground(lipgloss.Color(c.dim)),
 		toolHeader:     base.Bold(true).Foreground(lipgloss.Color(c.dim)),
 		toolBody:       base.Foreground(lipgloss.Color(c.faint)),
+
+		subagentHeader: base.Bold(true).Foreground(lipgloss.Color(c.dim)),
+		subagentBody:   base.Foreground(lipgloss.Color(c.faint)).PaddingLeft(2),
 
 		palItem: base.Foreground(lipgloss.Color(c.dim)),
 		palDesc: base.Foreground(lipgloss.Color(c.faint)),

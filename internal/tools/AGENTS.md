@@ -6,6 +6,14 @@ Built-in ADK functiontools and the allow/ask/deny approval gate.
   `read_file`, `write_file`, `glob`, `grep`, `memory_read`, `memory_write`,
   `memory_list`, `memory_delete`. Handlers are `func(agent.Context, TArgs)
 (map[string]any, error)`; results carry an `output` (or `error`) key.
+- `BuildToolsFor(mem, workDir, policy, names)` returns a NAMED SUBSET of the
+  built-ins (nil/empty = all) WITHOUT binding ask rules to HITL
+  (RequireConfirmationProvider is not set). Sub-agent personas (internal/
+  harness) use it — they cannot answer a HITL round trip, so their agent
+  installs `subagentGateCallback`, which DENIES both Deny and Ask policy
+  decisions. `AskProvider[TArgs](policy, name)` is the exported
+  RequireConfirmationProvider builder for tools constructed outside this
+  package (run_subagent).
 - Input structs need `json` tags AND a `jsonschema` tag whose value IS the
   description — **do not write `jsonschema:"description=..."`** (jsonschema-go
   v0.4.3 rejects the prefix). `functiontool.New` is generic; call it with

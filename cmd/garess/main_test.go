@@ -154,3 +154,55 @@ func TestInitRejectsStrayArgs(t *testing.T) {
 		t.Error("init with stray args must not write a config")
 	}
 }
+
+// writeFile creates path with content, creating parents as needed.
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReportPersonas(t *testing.T) {
+	dir := chdirTemp(t)
+	// Project personas: .garess/agents/ and plain agents/.
+	writeFile(t, filepath.Join(dir, ".garess", "agents", "researcher.md"), `---
+name: researcher
+description: Reads code.
+tools: [read_file, grep]
+---
+Research the code.
+`)
+	writeFile(t, filepath.Join(dir, "agents", "reviewer.md"), `---
+description: Reviews changes.
+---
+Review.
+`)
+	// A user-level persona that is not model-invocable.
+	writeFile(t, filepath.Join(dir, ".config", "garess", "agents", "internal.md"), `---
+name: internal
+description: Hidden helper.
+disable-model-invocation: true
+---
+Helper.
+`)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+
+	out := captureStdout(t, reportPersonas)
+	for _, want := range []string{"personas:", "researcher: Reads code.", "reviewer: Reviews changes.", "internal: Hidden helper.", "not model-invocable"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("reportPersonas missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestReportPersonasNone(t *testing.T) {
+	chdirTemp(t)
+	out := captureStdout(t, reportPersonas)
+	if !strings.Contains(out, "no custom-agent files") {
+		t.Errorf("expected the no-personas message, got:\n%s", out)
+	}
+}
